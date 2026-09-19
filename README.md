@@ -1,16 +1,44 @@
 # Calls
 
-1:1 WhatsApp voice calling for the Light Phone III, built as a LightOS tool
-(`com.lightphone.calls`) on the [light-sdk](https://github.com/lightphone/light-sdk).
+Calls is a phone app for the Light Phone III that works with WhatsApp. Link it
+to your WhatsApp account once — the same way WhatsApp Web links to your phone —
+and after that real WhatsApp calls ring on the Light Phone.
 
-- Linked-device pairing: scan the WhatsApp QR from **Settings → Linked devices**
-  — the phone becomes a companion WhatsApp device, like WhatsApp Desktop.
-- Calls run through an in-process Rust bridge ([whatsapp-rust](https://github.com/oxidezap/whatsapp-rust)
-  `voip`, MIT) exported to Kotlin via UniFFI; sync and audio live in the tool's
-  embedded server library.
-- **Unofficial client — use a secondary number.** This is not an official
-  WhatsApp client; accounts linked to it may violate WhatsApp's Terms of
-  Service and be banned. Use a secondary/throwaway number, not your primary.
+Today Calls handles **1:1 voice calls**: incoming and outgoing, end-to-end
+encrypted, interoperating with the official WhatsApp apps on the other end.
+
+Roadmap:
+
+- **Video calls** — the call transport already supports it; the remaining work
+  is camera and video rendering on the phone.
+- **Group calls** — the underlying library already implements them; exposing
+  them in the tool's UI is the remaining work.
+
+## How it works
+
+Calls is a single Android app built from three layers:
+
+- **A Rust core** ([whatsapp-rust](https://github.com/oxidezap/whatsapp-rust))
+  does the heavy lifting: it connects to WhatsApp as a linked device and
+  implements the entire call path — signaling, encryption, the voice codec,
+  and relay transport. It is pure Rust with a permissive (MIT) license.
+- **A thin bridge** (UniFFI) exposes that core to the Android side: call
+  commands go in, call events and raw microphone/speaker audio come out.
+- **The Kotlin app** handles everything the user touches: the screens, the
+  microphone and speaker, battery-friendly background connection, and call
+  history. It follows the [light-sdk](https://github.com/lightphone/light-sdk)
+  tool model for LightOS.
+
+## Disclosures
+
+- Calls is an **unofficial** client. It is not affiliated with, endorsed by, or
+  connected to WhatsApp or Meta.
+- Per the underlying library's own disclaimer: *"Using custom WhatsApp clients
+  may violate Meta's Terms of Service and could result in account suspension.
+  Use at your own risk."*
+- Calls links to your account as a companion device and processes your call
+  audio locally on the phone. No call content, credentials, or session data
+  leave the device except toward WhatsApp's own servers.
 
 ## Building
 
