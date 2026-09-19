@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application>
+        <provider
+            android:name=".ServerBootstrapProvider"
+            android:authorities="com.lightphone.calls.server.bootstrap"
+            android:exported="false" />
+
+        <!-- Persistent WhatsApp WebSocket (no GMS — the socket is the push channel). -->
+        <service
+            android:name=".WaSyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Fronts an active call (mic capture while foreground-visible). -->
+        <service
+            android:name=".WaCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- AOSP runtime-permission host for the SDK permission flow (the
+             screens request RECORD_AUDIO through it). Translucent so the
+             system dialog is the only thing visible. -->
+        <activity
+            android:name=".WaPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+
+</manifest>

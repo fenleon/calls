@@ -1,0 +1,7 @@
+[tool]
+id = "com.lightphone.calls"
+label = "Calls"
+versionCode = 1
+versionName = "0.1.0"
+serverPackage = "com.lightphone.calls"
+orientation = "portrait"

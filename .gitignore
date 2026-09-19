@@ -1,0 +1,26 @@
+# Android
+.gradle/
+.kotlin/
+build/
+app/build/
+server/build/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Misc
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Rust build outputs (the whatsapp-rust bridge)
+rust/target/

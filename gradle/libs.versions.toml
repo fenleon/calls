@@ -1,0 +1,27 @@
+[versions]
+agp = "8.12.3"
+kotlin = "2.3.20"
+kotlinx-coroutines = "1.10.2"
+kotlinx-serialization = "1.8.1"
+sdk = "0.1.0"
+zxing = "3.5.3"
+
+[libraries]
+junit = { module = "junit:junit", version = "4.13.2" }
+kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+sdk-ui = { module = "com.thelightphone:sdk-ui", version.ref = "sdk" }
+sdk-client = { module = "com.thelightphone:sdk-client", version.ref = "sdk" }
+sdk-server = { module = "com.thelightphone:sdk-server", version.ref = "sdk" }
+sdk-shared = { module = "com.thelightphone:sdk-shared", version.ref = "sdk" }
+zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version = "2.3.6" }
+light-sdk = { id = "com.thelightphone.light-sdk" }
