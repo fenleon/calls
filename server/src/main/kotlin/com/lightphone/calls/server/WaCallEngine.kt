@@ -25,6 +25,10 @@ object WaCallEngine : WaListener {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error
 
+    /** Auto-restarts since the last successful pairing — caps the watchdog /
+     *  unlink respawn loop when recovery is hopeless. */
+    private var autoRestarts = 0
+
     @Volatile
     private var bridge: WaBridge? = null
     private var appContext: Context? = null
@@ -105,6 +109,18 @@ object WaCallEngine : WaListener {
 
     suspend fun terminate() = bridgeOrThrow().terminate()
 
+    /** Fresh pairing flow: the QR refs expire after ~3 minutes and
+     *  whatsapp-rust disconnects a QR-only session (WA Web's UNPAIRED_IDLE —
+     *  the "reload" is the surface's job). Aborts the old bot and respawns
+     *  one on the same store; the new `PairingQr` rotations land on
+     *  [events]. Runs on the engine scope (bot start is slow). */
+    fun restartPairing() {
+        // Park the flow on NeedPairing so a subscribing pairing screen shows
+        // blank instead of replaying the dead pre-restart QR.
+        _events.value = WaEvent.NeedPairing
+        scope.launch { runCatching { bridgeOrThrow().restartPairing() } }
+    }
+
     suspend fun setMuted(muted: Boolean) = bridgeOrThrow().setMuted(muted)
 
     /** Fire-and-forget decline of the incoming offer — runs on the engine's
@@ -184,6 +200,32 @@ object WaCallEngine : WaListener {
                         at = System.currentTimeMillis(),
                     ),
                 )
+            }
+            is WaEvent.Paired -> {
+                // Only a real pairing (PairSuccess) clears the respawn cap —
+                // a mere transport connect fires inside every respawn round.
+                if (event.fresh) autoRestarts = 0
+            }
+            is WaEvent.Unlinked -> {
+                // Server-side unlink: the stored registration is revoked and
+                // reconnecting loops forever — wipe the store and register
+                // fresh. Capped so a hopeless environment can't spin forever.
+                if (autoRestarts >= 3) {
+                    _error.value = "WhatsApp disconnected — reopen the tool"
+                } else {
+                    autoRestarts++
+                    scope.launch { runCatching { bridgeOrThrow().resetSession() } }
+                }
+            }
+            is WaEvent.Disconnected -> {
+                // Run loop died while the session was still valid: respawn
+                // on the intact store (same cap).
+                if (autoRestarts >= 3) {
+                    _error.value = "WhatsApp disconnected — reopen the tool"
+                } else {
+                    autoRestarts++
+                    scope.launch { runCatching { restartPairing() } }
+                }
             }
             else -> Unit
         }

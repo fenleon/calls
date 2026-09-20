@@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
@@ -33,10 +36,9 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
-import com.thelightphone.sdk.ui.LightTopBar
-import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import com.thelightphone.sdk.ui.verticalGridUnitsAsDp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -54,6 +56,10 @@ class DialViewModel(initialNumber: String?) : LightViewModel<Unit>() {
 
     fun deleteDigit() {
         number.value = number.value.dropLast(1)
+    }
+
+    fun clearNumber() {
+        number.value = ""
     }
 
     fun onCallTapped() {
@@ -126,44 +132,46 @@ class DialScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                LightTopBar(
-                    leftButton = LightBarButton.LightIcon(
-                        icon = LightIcons.BACK,
-                        onClick = { goBack() },
-                    ),
-                    center = LightTopBarCenter.Text("Dial"),
-                )
+                // Dialer layout: the keypad is bottom-anchored (a one-buffer
+                // gap above the bottom bar) and the typed header overlays the
+                // top — so typing never shifts the pad. `×` dismisses the
+                // dialpad; the `<` glyph deletes, long-press clears.
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
+                        .weight(1f)
+                        .fillMaxWidth(),
                 ) {
-                    LightText(
-                        text = number.ifEmpty { "Enter a number" },
-                        variant = LightTextVariant.Heading,
-                        align = TextAlign.Center,
-                        modifier = Modifier.align(Alignment.Center),
-                    )
                     if (number.isNotEmpty()) {
                         Box(
                             modifier = Modifier
-                                .align(Alignment.CenterEnd)
-                                .lightClickable(onClick = viewModel::deleteDigit),
+                                .fillMaxWidth()
+                                .statusBarsPadding()
+                                .height(3f.gridUnitsAsDp()),
                         ) {
-                            LightIcon(icon = LightIcons.DELETE, contentDescription = "Delete")
+                            LightText(
+                                text = number,
+                                variant = LightTextVariant.Heading,
+                                align = TextAlign.Center,
+                                modifier = Modifier.align(Alignment.Center),
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .padding(end = 1f.gridUnitsAsDp())
+                                    .lightClickable(
+                                        onClick = viewModel::deleteDigit,
+                                        onLongClick = viewModel::clearNumber,
+                                        onLongClickLabel = "Clear",
+                                    ),
+                            ) {
+                                LightIcon(icon = LightIcons.BACK, contentDescription = "Delete digit, hold to clear")
+                            }
                         }
                     }
-                }
-                error?.let { message ->
-                    LightText(
-                        text = message,
-                        variant = LightTextVariant.Superfine,
-                        align = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                Box(modifier = Modifier.weight(1f)) {
-                    Column(modifier = Modifier.fillMaxSize()) {
+                    Column(
+                        modifier = Modifier.align(Alignment.BottomCenter),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
                         listOf(
                             listOf('1', '2', '3'),
                             listOf('4', '5', '6'),
@@ -171,14 +179,12 @@ class DialScreen(
                             listOf(null, '0', null),
                         ).forEach { rowDigits ->
                             Row(
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.height(5f.verticalGridUnitsAsDp()),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 rowDigits.forEach { digit ->
                                     Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .fillMaxHeight(),
+                                        modifier = Modifier.width(6f.gridUnitsAsDp()),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         when (digit) {
@@ -191,12 +197,31 @@ class DialScreen(
                         }
                     }
                 }
+                error?.let { message ->
+                    LightText(
+                        text = message,
+                        variant = LightTextVariant.Superfine,
+                        align = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 LightBottomBar(
                     items = listOf(
-                        LightBarButton.Text(
-                            text = if (busy) "…" else "CALL",
-                            onClick = { viewModel.onCallTapped() },
+                        null,
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CLOSE,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss dialpad",
                         ),
+                        if (number.isEmpty()) {
+                            null
+                        } else {
+                            LightBarButton.LightIcon(
+                                icon = LightIcons.CALL,
+                                onClick = { viewModel.onCallTapped() },
+                                contentDescription = "Call",
+                            )
+                        },
                     ),
                 )
             }
@@ -208,9 +233,10 @@ class DialScreen(
 private fun DigitKey(digit: Char, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .lightClickable(onClick = onClick)
-            .padding(0.5f.gridUnitsAsDp()),
+            .fillMaxHeight()
+            .lightClickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
     ) {
-        LightText(text = digit.toString(), variant = LightTextVariant.Title)
+        LightText(text = digit.toString(), variant = LightTextVariant.Subtitle)
     }
 }

@@ -111,9 +111,9 @@ Bridge rules:
 Screens (all `LightScreen`/`LightScreenViewModel`; toolbox launch; `@InitialScreen` = call log; taps/toggles only — **no long-press**):
 
 - **Pairing** — shown until linked. Renders the library's QR payload via ZXing (allowlisted) + pair-code fallback text. No content, no messages — pure setup.
-- **Call log (initial)** — recent calls (in/out/missed + peer name/number), tap to call. JSON persisted in private storage.
+- **Call log (initial)** — recent calls (in/out/missed + peer name/number), tap to call. JSON persisted in private storage. **Layout (per native Phone reference, 2026-09-20):** row grammar = `recents-logged.png` — date line above, **name/number under the date**, direction by alignment (outgoing right, incoming left, missed left with ×-badge handset + "missed call" text). **Bottom bar, 3 icon slots:** settings cog (left) · dialer (center) · contacts (right). Settings holds the WhatsApp connect/pairing entry. Dialer opens the native-style dialpad (240×200 keys, 3×4 grid; typed state = centered one-line number, adaptive size, "…" overflow). Contacts = all contacts linked to the account (when available).
 - **Active call** — peer, duration, mute toggle, speaker toggle, hang up; video (M3) adds start/stop video + accept-upgrade prompt when `VideoStateChanged` arrives with `is_upgrade_request()`.
-- **Incoming call** — full-screen answer/decline.
+- **Incoming call** — full-screen answer/decline. All call states (**connecting / connected / incoming**) share one screen design, matching the native Phone tool (`call-active/call-connected/call-incoming.png`): lowercase status line ("connecting…" / "connected" / "incoming…") above a large centered peer name (raw formatted number when unknown), icon toggle row with underline = active, hang-up × centered at bottom (incoming: × decline bottom-left, △ answer bottom-right).
 - **Settings** — paired-account status, logout, audio-route default, diagnostics toggle (opt-in verbose logging).
 
 Design pass via the `lightos-design` skill at end of each implementation session.

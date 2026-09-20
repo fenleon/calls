@@ -24,3 +24,6 @@ captures/
 
 # Rust build outputs (the whatsapp-rust bridge)
 rust/target/
+
+# Verification screenshots (never commit)
+screenshots/

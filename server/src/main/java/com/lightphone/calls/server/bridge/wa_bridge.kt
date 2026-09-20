@@ -766,6 +766,10 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -792,6 +796,10 @@ fun uniffi_wa_bridge_checksum_method_wabridge_place_call(
 fun uniffi_wa_bridge_checksum_method_wabridge_recv_playout_pcm(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_reject_call(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_reset_session(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_restart_pairing(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_send_mic_pcm(
 ): Short
@@ -873,6 +881,10 @@ fun uniffi_wa_bridge_fn_method_wabridge_recv_playout_pcm(`ptr`: Pointer,`timeout
 ): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_reject_call(`ptr`: Pointer,
 ): Long
+fun uniffi_wa_bridge_fn_method_wabridge_reset_session(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_restart_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_send_mic_pcm(`ptr`: Pointer,`samples`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_set_muted(`ptr`: Pointer,`muted`: Byte,
@@ -1029,6 +1041,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_reject_call() != 13409.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_reset_session() != 22808.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_restart_pairing() != 15675.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_send_mic_pcm() != 40540.toShort()) {
@@ -1529,6 +1547,23 @@ public interface WaBridgeInterface {
     suspend fun `rejectCall`()
     
     /**
+     * After a server-side unlink the stored registration is revoked:
+     * reconnecting with it loops forever (connect → LoggedOut → ...). Drop
+     * the bot AND wipe the session store so the respawn registers as a
+     * brand-new device (fresh QRs, fresh device identity).
+     */
+    fun `resetSession`()
+    
+    /**
+     * WA Web's UNPAIRED_IDLE model: the pairing QR refs expire after
+     * ~60 s + 5×20 s and whatsapp-rust then disconnects a QR-only flow,
+     * leaving the "click to reload" to the surface. Aborts the current bot
+     * and spawns a fresh one on the same session store — a new pairing flow
+     * with fresh QRs. Kotlin calls this when the user taps connect.
+     */
+    fun `restartPairing`()
+    
+    /**
      * Pushes one mic frame (960 samples = 60 ms at 16 kHz) from the Kotlin
      * capture thread. The channel is bounded(4); when full the OLDEST frame
      * is dropped so capture never blocks. The bridge holds a receiver clone
@@ -1769,6 +1804,43 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
         WaException.ErrorHandler,
     )
     }
+
+    
+    /**
+     * After a server-side unlink the stored registration is revoked:
+     * reconnecting with it loops forever (connect → LoggedOut → ...). Drop
+     * the bot AND wipe the session store so the respawn registers as a
+     * brand-new device (fresh QRs, fresh device identity).
+     */
+    @Throws(WaException::class)override fun `resetSession`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_reset_session(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * WA Web's UNPAIRED_IDLE model: the pairing QR refs expire after
+     * ~60 s + 5×20 s and whatsapp-rust then disconnects a QR-only flow,
+     * leaving the "click to reload" to the surface. Aborts the current bot
+     * and spawns a fresh one on the same session store — a new pairing flow
+     * with fresh QRs. Kotlin calls this when the user taps connect.
+     */
+    @Throws(WaException::class)override fun `restartPairing`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_restart_pairing(
+        it, _status)
+}
+    }
+    
+    
 
     
     /**
@@ -2040,7 +2112,29 @@ sealed class WaEvent {
         companion object
     }
     
-    object Paired : WaEvent()
+    /**
+     * `fresh` distinguishes a real pairing (`PairSuccess`) from a mere
+     * transport connect of an existing session (`Connected`) — only the
+     * former resets the surface's respawn cap.
+     */
+    data class Paired(
+        val `fresh`: kotlin.Boolean) : WaEvent() {
+        companion object
+    }
+    
+    /**
+     * The server revoked this device's link (logged out from the primary).
+     * The stored registration is dead and reconnecting with it loops
+     * forever — the surface wipes the session store and restarts.
+     */
+    object Unlinked : WaEvent()
+    
+    
+    /**
+     * The bot's run loop died (crash / unrecoverable disconnect) while the
+     * session was still valid: respawn without wiping the store.
+     */
+    object Disconnected : WaEvent()
     
     
     data class IncomingCall(
@@ -2088,21 +2182,25 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             2 -> WaEvent.PairingQr(
                 FfiConverterString.read(buf),
                 )
-            3 -> WaEvent.Paired
-            4 -> WaEvent.IncomingCall(
+            3 -> WaEvent.Paired(
+                FfiConverterBoolean.read(buf),
+                )
+            4 -> WaEvent.Unlinked
+            5 -> WaEvent.Disconnected
+            6 -> WaEvent.IncomingCall(
                 FfiConverterString.read(buf),
                 FfiConverterBoolean.read(buf),
                 )
-            5 -> WaEvent.Ringing(
+            7 -> WaEvent.Ringing(
                 FfiConverterString.read(buf),
                 )
-            6 -> WaEvent.CallStarted(
+            8 -> WaEvent.CallStarted(
                 FfiConverterString.read(buf),
                 )
-            7 -> WaEvent.CallEnded(
+            9 -> WaEvent.CallEnded(
                 FfiConverterString.read(buf),
                 )
-            8 -> WaEvent.MissedCall(
+            10 -> WaEvent.MissedCall(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -2124,6 +2222,19 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             )
         }
         is WaEvent.Paired -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterBoolean.allocationSize(value.`fresh`)
+            )
+        }
+        is WaEvent.Unlinked -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is WaEvent.Disconnected -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -2180,31 +2291,40 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             }
             is WaEvent.Paired -> {
                 buf.putInt(3)
+                FfiConverterBoolean.write(value.`fresh`, buf)
+                Unit
+            }
+            is WaEvent.Unlinked -> {
+                buf.putInt(4)
+                Unit
+            }
+            is WaEvent.Disconnected -> {
+                buf.putInt(5)
                 Unit
             }
             is WaEvent.IncomingCall -> {
-                buf.putInt(4)
+                buf.putInt(6)
                 FfiConverterString.write(value.`peer`, buf)
                 FfiConverterBoolean.write(value.`isVideo`, buf)
                 Unit
             }
             is WaEvent.Ringing -> {
-                buf.putInt(5)
+                buf.putInt(7)
                 FfiConverterString.write(value.`peer`, buf)
                 Unit
             }
             is WaEvent.CallStarted -> {
-                buf.putInt(6)
+                buf.putInt(8)
                 FfiConverterString.write(value.`callId`, buf)
                 Unit
             }
             is WaEvent.CallEnded -> {
-                buf.putInt(7)
+                buf.putInt(9)
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
             is WaEvent.MissedCall -> {
-                buf.putInt(8)
+                buf.putInt(10)
                 FfiConverterString.write(value.`peer`, buf)
                 Unit
             }

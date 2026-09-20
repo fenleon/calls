@@ -16,7 +16,17 @@ use whatsapp_rust::{async_channel as chan, Jid};
 pub enum WaEvent {
     NeedPairing,
     PairingQr { payload: String },
-    Paired,
+    /// `fresh` distinguishes a real pairing (`PairSuccess`) from a mere
+    /// transport connect of an existing session (`Connected`) — only the
+    /// former resets the surface's respawn cap.
+    Paired { fresh: bool },
+    /// The server revoked this device's link (logged out from the primary).
+    /// The stored registration is dead and reconnecting with it loops
+    /// forever — the surface wipes the session store and restarts.
+    Unlinked,
+    /// The bot's run loop died (crash / unrecoverable disconnect) while the
+    /// session was still valid: respawn without wiping the store.
+    Disconnected,
     IncomingCall { peer: String, is_video: bool },
     /// An outgoing call is ringing — the offer is out, the peer has not
     /// answered yet. `peer` is the display string (`place_call` input).
@@ -118,6 +128,13 @@ pub struct WaBridge {
     /// The spawned bot; dropping a `BotHandle` aborts the run loop, so it is
     /// kept for the process lifetime (and for Task 5's call control).
     handle: Mutex<Option<BotHandle>>,
+    /// Session store path from `start` — `restart_pairing` respawns the bot
+    /// on the same store without Kotlin passing it again.
+    db_path: Mutex<Option<std::path::PathBuf>>,
+    /// Bumped on every respawn; each bot's watchdog exits when its
+    /// generation is superseded (otherwise aborted bots' watchdogs fire
+    /// spurious restarts 30 s later).
+    generation: Arc<std::sync::atomic::AtomicU64>,
     /// Own JID as the UI renders it ("Paired as …"). Never logged.
     account: Arc<Mutex<Option<String>>>,
     /// Microphone push channel, bounded so a stalled engine can never block
@@ -295,6 +312,8 @@ impl WaBridge {
             events: tx,
             runtime: OnceLock::new(),
             handle: Mutex::new(None),
+            db_path: Mutex::new(None),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             account: Arc::new(Mutex::new(None)),
             mic_tx,
             mic_rx,
@@ -314,7 +333,61 @@ impl WaBridge {
     pub fn start(&self, data_dir: String) -> Result<(), WaError> {
         std::fs::create_dir_all(&data_dir).map_err(|e| WaError::Io { msg: e.to_string() })?;
         let db_path = std::path::Path::new(&data_dir).join("whatsapp.db");
+        *self.db_path.lock().unwrap() = Some(db_path.clone());
+        self.spawn_bot(&db_path)
+    }
 
+    /// WA Web's UNPAIRED_IDLE model: the pairing QR refs expire after
+    /// ~60 s + 5×20 s and whatsapp-rust then disconnects a QR-only flow,
+    /// leaving the "click to reload" to the surface. Aborts the current bot
+    /// and spawns a fresh one on the same session store — a new pairing flow
+    /// with fresh QRs. Kotlin calls this when the user taps connect.
+    pub fn restart_pairing(&self) -> Result<(), WaError> {
+        let db_path = self
+            .db_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        // Dropping the handle aborts the old run loop; the pairing flow has
+        // no state worth a graceful shutdown.
+        let _ = self.handle.lock().unwrap().take();
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.account.lock().unwrap() = None;
+        self.spawn_bot(&db_path)
+    }
+
+    /// After a server-side unlink the stored registration is revoked:
+    /// reconnecting with it loops forever (connect → LoggedOut → ...). Drop
+    /// the bot AND wipe the session store so the respawn registers as a
+    /// brand-new device (fresh QRs, fresh device identity).
+    pub fn reset_session(&self) -> Result<(), WaError> {
+        let db_path = self
+            .db_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        let _ = self.handle.lock().unwrap().take();
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.account.lock().unwrap() = None;
+        if let Some(dir) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        self.spawn_bot(&db_path)
+    }
+}
+
+impl WaBridge {
+    /// Builds and spawns the bot on `db_path`, publishes the handle and
+    /// reports `Paired` (session restored) or `NeedPairing` (fresh device).
+    /// Not part of the UniFFI surface (private helper; `&Path` can't lift).
+    fn spawn_bot(&self, db_path: &std::path::Path) -> Result<(), WaError> {
+        // `reset_session` wipes the store directory — recreate it.
+        std::fs::create_dir_all(db_path.parent().ok_or(WaError::Io {
+            msg: "no store dir".to_string(),
+        })?)
+        .map_err(|e| WaError::Io { msg: e.to_string() })?;
         let runtime = self.runtime.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -334,6 +407,22 @@ impl WaBridge {
                 .map_err(|e| WaError::Io { msg: e.to_string() })?;
             let bot = Bot::builder()
                 .with_backend(store)
+                // The companion name WhatsApp shows in "Linked devices" comes
+                // from these props — the default os ("rust") renders as
+                // "Other device". Advertise the real device everywhere.
+                .with_device_props(
+                    whatsapp_rust::wacore::store::DevicePropsOverride::new()
+                        .with_os("Light Phone 3")
+                        // Device label (verified by relink tests): with the
+                        // platform UNKNOWN both the name and platform fields
+                        // read "Other device" — WhatsApp ignores the os
+                        // string there. With CHROME the entry reads
+                        // "Google Chrome (Light Phone 3)", which is the best
+                        // achievable label; see WORKLOG outstanding item.
+                        .with_platform_type(
+                            whatsapp_rust::waproto::whatsapp::device_props::PlatformType::CHROME,
+                        ),
+                )
                 .on_qr_code(move |code, _timeout| {
                     let tx = qr_tx.clone();
                     async move {
@@ -352,8 +441,13 @@ impl WaBridge {
                         // (via `WaBridge::account`).
                         if let Event::PairSuccess(success) = &*event {
                             *account.lock().unwrap() = Some(success.id.to_string());
-                            let _ = tx.send(WaEvent::Paired);
+                            let _ = tx.send(WaEvent::Paired { fresh: true });
                             return;
+                        }
+                        // The primary revoked the link: the stored identity is
+                        // dead — drop it so `account()` reports unpaired.
+                        if matches!(event.as_ref(), Event::LoggedOut(_)) {
+                            *account.lock().unwrap() = None;
                         }
                         // Keep the newest unanswered 1:1 offer for accept/reject;
                         // a peer cancel ends the ring. A missed-call notice or an
@@ -420,18 +514,49 @@ impl WaBridge {
         let restored = handle.client().pn().map(|jid| {
             *self.account.lock().unwrap() = Some(jid.to_string());
         });
+        let wd_client = handle.client();
+        // Arm the watchdog only when this bot was expected to be paired (a
+        // restored session): a revoked session never sets the client's
+        // logged-in flag, so client state alone can't distinguish "dead
+        // paired session" from "unpaired and idle on the QR screen" — the
+        // unpaired case is legitimate and covered by the user-driven
+        // `restart_pairing`.
+        let wd_expect_paired = restored.is_some();
         *self.handle.lock().unwrap() = Some(handle);
+
+        // Watchdog: if a bot that was expected to be paired never connects
+        // (or loses the connection for good), the surface must restart it —
+        // otherwise the app displays a session that no longer exists.
+        let wd_events = self.events.clone();
+        let generation = Arc::clone(&self.generation);
+        let wd_generation = generation.load(std::sync::atomic::Ordering::Relaxed);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if generation.load(std::sync::atomic::Ordering::Relaxed) != wd_generation {
+                    return; // superseded by a respawn — stand down
+                }
+                if wd_expect_paired && !wd_client.is_connected() {
+                    // Same surface contract as a server-side unlink: restart.
+                    let _ = wd_events.send(WaEvent::Disconnected);
+                    break;
+                }
+            }
+        });
 
         // A stored device means the session was restored; a fresh device gets
         // the pairing flow (its QR arrives as a PairingQr event).
         self.emit(if restored.is_some() {
-            WaEvent::Paired
+            WaEvent::Paired { fresh: false }
         } else {
             WaEvent::NeedPairing
         });
         Ok(())
     }
+}
 
+#[uniffi::export]
+impl WaBridge {
     /// Own account JID once known — fresh pairing via `PairSuccess`, restored
     /// session via the device snapshot. `None` before pairing.
     pub fn account(&self) -> Option<String> {
@@ -824,11 +949,13 @@ fn map_event(event: &Event, resolved_peer: Option<&str>) -> Option<WaEvent> {
         Event::PairingQrCode(qr) => Some(WaEvent::PairingQr {
             payload: qr.code.clone(),
         }),
-        Event::Connected(_) => Some(WaEvent::Paired),
+        Event::Connected(_) => Some(WaEvent::Paired { fresh: false }),
         // The session is unusable: back to the pairing flow.
-        Event::PairError(_) | Event::LoggedOut(_) | Event::PairingQrCodesExhausted(_) => {
-            Some(WaEvent::NeedPairing)
-        }
+        Event::PairError(_) | Event::PairingQrCodesExhausted(_) => Some(WaEvent::NeedPairing),
+        // Server-side unlink: the registration is revoked. A distinct event
+        // (not NeedPairing) so the surface can restart the flow exactly once
+        // — a respawn's own fresh-device `NeedPairing` must not loop it.
+        Event::LoggedOut(_) => Some(WaEvent::Unlinked),
         Event::IncomingCall(incoming) => match &incoming.action {
             // 1:1 offers only (SPEC: group calls out of scope).
             CallAction::Offer {

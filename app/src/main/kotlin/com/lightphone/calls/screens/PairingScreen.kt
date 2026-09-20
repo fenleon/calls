@@ -31,11 +31,14 @@ import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
+import com.thelightphone.sdk.ui.LightTopBar
+import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -89,15 +92,19 @@ class PairingScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(LightThemeTokens.colors.background)
-                    .padding(horizontal = 2f.gridUnitsAsDp()),
+                    .background(LightThemeTokens.colors.background),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
-                LightText(text = "Link WhatsApp", variant = LightTextVariant.Heading)
+                LightTopBar(
+                    leftButton = LightBarButton.LightIcon(
+                        icon = LightIcons.BACK,
+                        onClick = { goBack() },
+                    ),
+                    center = LightTopBarCenter.Text("Link WhatsApp"),
+                )
                 Spacer(modifier = Modifier.padding(top = 1f.gridUnitsAsDp()))
                 LightText(
-                    text = "On your other phone: WhatsApp ▸ Settings ▸ Linked devices ▸ Link a device",
+                    text = "Scan the QR code to link to your account",
                     variant = LightTextVariant.Copy,
                     align = TextAlign.Center,
                 )
@@ -112,6 +119,14 @@ class PairingScreen(
                             modifier = Modifier
                                 .fillMaxWidth(0.85f)
                                 .aspectRatio(1f),
+                        )
+                    } ?: run {
+                        // No spinner in the Light icon set — a lowercase
+                        // status word is the design system's loading state
+                        // (same grammar as "connecting…" / "incoming…").
+                        LightText(
+                            text = "loading…",
+                            variant = LightTextVariant.Copy,
                         )
                     }
                 }

@@ -3,6 +3,7 @@ package com.lightphone.calls.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,6 +26,7 @@ import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
@@ -41,14 +43,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 class HomeViewModel : LightViewModel<Unit>() {
-
-    /** Latest pairing QR from the engine — non-null routes to PairingScreen
-     *  (cleared once consumed so back-navigation doesn't re-push it).
-     *  [pairingActive] gates this: while the pairing screen is up, further
-     *  PairingQr rotations are ignored here (the pairing screen observes the
-     *  events itself) so navigateTo can't stack duplicate screens. */
-    val pairingQr = MutableStateFlow<String?>(null)
-    val pairingActive = MutableStateFlow(false)
 
     /** Own account once known ("Paired as …"). */
     val account = MutableStateFlow<String?>(null)
@@ -69,22 +63,23 @@ class HomeViewModel : LightViewModel<Unit>() {
      *  bridge-side guard is a follow-up). */
     val callActive = MutableStateFlow(false)
 
-    /** The persisted call log, newest first. */
+    /** The persisted call log, newest first. Distinct peers double as the
+     *  contacts list until the bridge exposes a real contacts API. */
     val log = MutableStateFlow<List<CallLogEntry>>(emptyList())
 
     init {
-        account.value = WaCallEngine.account()
         log.value = WaCallEngine.callLogEntries().asReversed()
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
                 when (event) {
-                    is WaEvent.PairingQr ->
-                        if (!pairingActive.value) pairingQr.value = event.payload
                     is WaEvent.NeedPairing -> Unit
+                    // Pairing is user-driven from Settings (which restarts the
+                    // flow for fresh QRs) — the pairing screen observes the
+                    // QR rotations itself; home never auto-routes to it, or
+                    // backing out just gets re-pushed on every rotation.
+                    is WaEvent.PairingQr -> Unit
                     is WaEvent.Paired -> {
                         account.value = WaCallEngine.account()
-                        pairingActive.value = false
-                        pairingQr.value = null
                     }
                     is WaEvent.IncomingCall ->
                         if (routeToCall.value == null && !incomingActive.value &&
@@ -117,13 +112,6 @@ class HomeViewModel : LightViewModel<Unit>() {
         }
     }
 
-    fun consumeQr(): String? {
-        val payload = pairingQr.value
-        pairingQr.value = null
-        pairingActive.value = true
-        return payload
-    }
-
     fun consumeIncoming(): String? {
         val peer = incomingPeer.value
         incomingPeer.value = null
@@ -138,9 +126,8 @@ class HomeViewModel : LightViewModel<Unit>() {
     }
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
-        // Backing out of PairingScreen / IncomingCallScreen returns here:
-        // clear the gates so the next event re-opens its route.
-        pairingActive.value = false
+        // Backing out of IncomingCallScreen returns here: clear the gate so
+        // the next event re-opens its route.
         incomingActive.value = false
     }
 }
@@ -157,20 +144,10 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
-        val pairingQr by viewModel.pairingQr.collectAsState()
-        val account by viewModel.account.collectAsState()
         val incomingPeer by viewModel.incomingPeer.collectAsState()
         val routeToCall by viewModel.routeToCall.collectAsState()
         val log by viewModel.log.collectAsState()
-        val engineError by WaCallEngine.error.collectAsState()
 
-        LaunchedEffect(pairingQr) {
-            if (pairingQr != null) {
-                viewModel.consumeQr()?.let { payload ->
-                    navigateTo(screenFactory = { PairingScreen(it, payload) })
-                }
-            }
-        }
         LaunchedEffect(incomingPeer) {
             if (incomingPeer != null) {
                 viewModel.consumeIncoming()?.let { peer ->
@@ -192,52 +169,49 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                Box(modifier = Modifier.weight(1f)) {
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
+                if (log.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
-                        LightText(text = "WhatsApp", variant = LightTextVariant.Heading)
-                        account?.let { name ->
-                            Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                            LightText(text = "Paired as $name", variant = LightTextVariant.Superfine, lighten = true)
-                        }
-                        engineError?.let { message ->
-                            Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                            LightText(text = message, variant = LightTextVariant.Superfine)
-                        }
-                        Spacer(modifier = Modifier.padding(top = 1f.gridUnitsAsDp()))
-                        if (log.isEmpty()) {
-                            Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                LightText(
-                                    text = "No calls yet",
-                                    variant = LightTextVariant.Copy,
-                                    align = TextAlign.Center,
-                                )
-                            }
-                        } else {
-                            LightScrollView(modifier = Modifier.weight(1f)) {
-                                log.forEach { entry ->
-                                    CallLogRow(
-                                        entry = entry,
-                                        onClick = {
-                                            navigateTo(screenFactory = { activity ->
-                                                DialScreen(activity, peerLabel(entry.peer))
-                                            })
-                                        },
-                                    )
-                                }
-                            }
+                        LightText(
+                            text = "No calls yet",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                    }
+                } else {
+                    LightScrollView(modifier = Modifier.weight(1f)) {
+                        log.forEach { entry ->
+                            CallLogRow(
+                                entry = entry,
+                                onClick = {
+                                    navigateTo(screenFactory = { activity ->
+                                        DialScreen(activity, peerLabel(entry.peer))
+                                    })
+                                },
+                            )
                         }
                     }
                 }
                 LightBottomBar(
                     items = listOf(
                         LightBarButton.LightIcon(
+                            icon = LightIcons.SETTINGS,
+                            onClick = { navigateTo(screenFactory = { SettingsScreen(it) }) },
+                            contentDescription = "Settings",
+                        ),
+                        LightBarButton.LightIcon(
                             icon = LightIcons.DIALPAD,
                             onClick = { navigateTo(screenFactory = { DialScreen(it, null) }) },
                             contentDescription = "Dial",
+                        ),
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CONTACTS,
+                            onClick = { navigateTo(screenFactory = { ContactsScreen(it) }) },
+                            contentDescription = "Contacts",
                         ),
                     ),
                 )
@@ -246,38 +220,39 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     }
 }
 
-/** One call-log line: the peer number, with a "Missed ·" / direction marker
- *  and the time as the detail line. Tapping opens the dial screen prefilled
- *  with the number (the Call button there owns the mic permission). */
+/** One call-log row in the native Phone activity grammar (see
+ *  reference/lp3/screens/phone/recents-logged.png): date line above, the
+ *  caller's name/number under it, direction shown by alignment — outgoing
+ *  right, incoming left, missed left with the missed-call handset icon. */
 @Composable
 private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onClick)
-            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
+        horizontalAlignment = if (entry.outgoing && !entry.missed) {
+            Alignment.End
+        } else {
+            Alignment.Start
+        },
     ) {
-        LightText(text = peerLabel(entry.peer), variant = LightTextVariant.Copy)
-        val detail = buildString {
-            if (entry.missed) {
-                append("Missed")
-            } else if (entry.outgoing) {
-                append("Outgoing")
-            } else {
-                append("Incoming")
+        LightText(text = formatAt(entry.at), variant = LightTextVariant.Superfine)
+        if (entry.missed) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                LightIcon(icon = LightIcons.CALL_MISSED, contentDescription = "Missed call")
+                Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
+                LightText(text = peerLabel(entry.peer), variant = LightTextVariant.Copy)
             }
-            append(" · ")
-            append(formatAt(entry.at))
+        } else {
+            LightText(text = peerLabel(entry.peer), variant = LightTextVariant.Copy)
         }
-        LightText(text = detail, variant = LightTextVariant.Superfine)
     }
 }
 
 /** A stored peer JID ("49…@s.whatsapp.net" or bare number) as a number. */
 internal fun peerLabel(peer: String): String = peer.substringBefore('@')
 
-private fun formatAt(at: Long): String {
-    val time = Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault())
-    val pattern = if (time.toLocalDate() == java.time.LocalDate.now()) "HH:mm" else "MMM d"
-    return time.format(DateTimeFormatter.ofPattern(pattern))
-}
+private fun formatAt(at: Long): String =
+    Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofPattern("MMM d h:mm a"))

@@ -23,13 +23,12 @@ import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.rememberPermissionRequestLauncher
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
-import com.thelightphone.sdk.ui.LightTopBar
-import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -96,18 +95,24 @@ class IncomingCallScreen(
             if (permissionRequestTick > 0) permissionLauncher?.launch()
         }
 
+        // Native Phone incoming grammar (reference/lp3/screens/phone/
+        // call-incoming.png): "incoming…" status line above a large centered
+        // peer; × decline bottom-left, answer bottom-right. (Native uses a
+        // triangle for answer; the SDK icon set has the handset instead.)
         LightTheme(colors = themeColors) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                LightTopBar(center = LightTopBarCenter.Text("Incoming call"))
                 Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        LightText(text = peerLabel(peer), variant = LightTextVariant.Heading)
-                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                        LightText(text = "WhatsApp call", variant = LightTextVariant.Superfine)
+                        LightText(
+                            text = "incoming…",
+                            variant = LightTextVariant.Superfine,
+                        )
+                        Spacer(modifier = Modifier.padding(top = 1f.gridUnitsAsDp()))
+                        LightText(text = peerLabel(peer), variant = LightTextVariant.Title)
                         error?.let { message ->
                             Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
                             LightText(
@@ -120,16 +125,18 @@ class IncomingCallScreen(
                 }
                 LightBottomBar(
                     items = listOf(
-                        LightBarButton.Text(
-                            text = "DECLINE",
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CLOSE,
                             onClick = {
                                 WaCallEngine.reject()
                                 goBack()
                             },
+                            contentDescription = "Decline",
                         ),
-                        LightBarButton.Text(
-                            text = if (busy) "…" else "ANSWER",
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CALL,
                             onClick = { viewModel.onAnswerTapped() },
+                            contentDescription = if (busy) "Answering" else "Answer",
                         ),
                     ),
                 )
