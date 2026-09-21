@@ -1,5 +1,7 @@
 package com.lightphone.calls.screens
 
+import android.telephony.PhoneNumberUtils
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -7,11 +9,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -20,6 +26,7 @@ import com.lightphone.calls.server.CallLogEntry
 import com.lightphone.calls.server.WaCallEngine
 import com.lightphone.calls.server.bridge.WaEvent
 import com.thelightphone.sdk.InitialScreen
+import com.thelightphone.sdk.LightGlobalRoute
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -28,7 +35,7 @@ import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightIcons
-import com.thelightphone.sdk.ui.LightScrollView
+import com.thelightphone.sdk.ui.LightLazyScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
@@ -36,6 +43,7 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import java.util.Locale
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -47,15 +55,10 @@ class HomeViewModel : LightViewModel<Unit>() {
     /** Own account once known ("Paired as …"). */
     val account = MutableStateFlow<String?>(null)
 
-    /** Newest incoming offer — non-null routes to IncomingCallScreen.
-     *  [incomingActive] gates re-pushes while that screen is up. */
+    /** Newest incoming offer — gates re-pushes while the panel is up (the
+     *  routing itself goes through `LightGlobalRoute`). */
     val incomingPeer = MutableStateFlow<String?>(null)
     val incomingActive = MutableStateFlow(false)
-
-    /** The call id that started — non-null routes to ActiveCallScreen
-     *  (dial, answer and the ringing outgoing call converge here; cleared
-     *  on CallEnded so back out of the call screen doesn't re-push it). */
-    val routeToCall = MutableStateFlow<String?>(null)
 
     /** True from `Ringing`/`CallStarted` to `CallEnded` — extends the
      *  incoming gate: an offer arriving during a live call is not routed
@@ -68,7 +71,7 @@ class HomeViewModel : LightViewModel<Unit>() {
     val log = MutableStateFlow<List<CallLogEntry>>(emptyList())
 
     init {
-        log.value = WaCallEngine.callLogEntries().asReversed()
+        log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
                 when (event) {
@@ -82,53 +85,62 @@ class HomeViewModel : LightViewModel<Unit>() {
                         account.value = WaCallEngine.account()
                     }
                     is WaEvent.IncomingCall ->
-                        if (routeToCall.value == null && !incomingActive.value &&
-                            !callActive.value
-                        ) {
+                        if (!callActive.value && !incomingActive.value) {
                             incomingPeer.value = event.peer
+                            incomingActive.value = true
+                            // Route through LightGlobalRoute, not a screen
+                            // composition: hidden screens' collectors are
+                            // dead, so only this always-alive VM can make the
+                            // incoming panel appear over ANY screen.
+                            LightGlobalRoute.push { IncomingCallScreen(it, event.peer) }
                         }
-                    is WaEvent.Ringing -> {
-                        // Outgoing call accepted by the bridge (offer out,
-                        // peer not answering yet): route to the active-call
-                        // screen now — it shows "Ringing…" until the peer's
-                        // answer lands as `CallStarted`.
+                    is WaEvent.Ringing ->
+                        // Outgoing offer out (the dial tap already routed the
+                        // panel — this is a no-op then): a no-answer timeout
+                        // flash lives on the panel itself.
                         callActive.value = true
-                        routeToCall.value = WaCallEngine.currentCallPeer ?: event.peer
-                    }
                     is WaEvent.CallStarted -> {
                         callActive.value = true
-                        routeToCall.value = WaCallEngine.currentCallPeer ?: "call"
+                        // clearToRoot: an incoming panel may sit on the stack
+                        // below — the answered call's screen replaces it.
+                        pushActive(WaCallEngine.currentCallPeer ?: "call", clearToRoot = true)
                     }
                     is WaEvent.CallEnded -> {
                         callActive.value = false
-                        routeToCall.value = null
-                        log.value = WaCallEngine.callLogEntries().asReversed()
+                        incomingActive.value = false
+                        incomingPeer.value = null
+                        log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
                     }
-                    is WaEvent.MissedCall ->
-                        log.value = WaCallEngine.callLogEntries().asReversed()
+                    is WaEvent.MissedCall -> {
+                        // A caller cancel/expiry ends the offer (never a
+                        // CallEnded): release the incoming gates so the panel
+                        // closes and the next offer can route.
+                        incomingActive.value = false
+                        incomingPeer.value = null
+                        log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
+                    }
                     else -> Unit
                 }
             }
         }
     }
 
-    fun consumeIncoming(): String? {
-        val peer = incomingPeer.value
-        incomingPeer.value = null
-        incomingActive.value = true
-        return peer
-    }
-
-    fun consumeRoute(): String? {
-        val peer = routeToCall.value
-        routeToCall.value = null
-        return peer
+    /** One active-call push per call: the dial tap already routed the panel
+     *  for outgoing (engine flag), and the ringing panel itself observes
+     *  `CallStarted` — a later event must not stack a second screen. */
+    private fun pushActive(peer: String, clearToRoot: Boolean = false) {
+        if (WaCallEngine.activeScreenRouted) return
+        WaCallEngine.activeScreenRouted = true
+        LightGlobalRoute.push(clearToRoot = clearToRoot) { ActiveCallScreen(it, peer) }
     }
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         // Backing out of IncomingCallScreen returns here: clear the gate so
-        // the next event re-opens its route.
+        // the next event re-opens its route. Also re-read the log — entries
+        // are written the moment they happen (instant outgoing logging), so
+        // a return to home must not show a stale list.
         incomingActive.value = false
+        log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
     }
 }
 
@@ -144,24 +156,7 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
-        val incomingPeer by viewModel.incomingPeer.collectAsState()
-        val routeToCall by viewModel.routeToCall.collectAsState()
         val log by viewModel.log.collectAsState()
-
-        LaunchedEffect(incomingPeer) {
-            if (incomingPeer != null) {
-                viewModel.consumeIncoming()?.let { peer ->
-                    navigateTo(screenFactory = { IncomingCallScreen(it, peer) })
-                }
-            }
-        }
-        LaunchedEffect(routeToCall) {
-            if (routeToCall != null) {
-                viewModel.consumeRoute()?.let { peer ->
-                    navigateTo(screenFactory = { ActiveCallScreen(it, peer) })
-                }
-            }
-        }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -183,8 +178,21 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                         )
                     }
                 } else {
-                    LightScrollView(modifier = Modifier.weight(1f)) {
-                        log.forEach { entry ->
+                    // Thread anchored at the bottom (chat pattern): entries
+                    // render newest-first inside a reverseLayout lazy list, so
+                    // the latest sits at the bottom edge, older ones stack
+                    // upward, and a new entry lands at the bottom even when
+                    // the list is short. Rows are ~3.75gu tall (scrollbar
+                    // estimate).
+                    LightLazyScrollView(
+                        modifier = Modifier.weight(1f),
+                        reverseLayout = true,
+                        // Row pitch ≈ 5.9gu (2-line rows measured 3.75; the
+                        // duration row adds ~2gu) — the scrollbar's thumb
+                        // math uses this as the uniform height.
+                        uniformItemHeightGridUnits = 6.45f,
+                    ) {
+                        items(log.asReversed()) { entry ->
                             CallLogRow(
                                 entry = entry,
                                 onClick = {
@@ -220,10 +228,12 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     }
 }
 
-/** One call-log row in the native Phone activity grammar (see
- *  reference/lp3/screens/phone/recents-logged.png): date line above, the
- *  caller's name/number under it, direction shown by alignment — outgoing
- *  right, incoming left, missed left with the missed-call handset icon. */
+/** One call-log row in the native Phone per-contact grammar (see
+ *  reference/lp3/screens/phone/ + the live per-contact capture): date line
+ *  above, a gap, the handset glyph with the peer's name/number
+ *  bottom-aligned to it (direction shown by alignment — outgoing right,
+ *  incoming/missed left; the missed glyph marks unanswered calls), and the
+ *  connected duration ("0m 12s", "0s") under the glyph line. */
 @Composable
 private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
     Column(
@@ -238,20 +248,43 @@ private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
         },
     ) {
         LightText(text = formatAt(entry.at), variant = LightTextVariant.Superfine)
-        if (entry.missed) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                LightIcon(icon = LightIcons.CALL_MISSED, contentDescription = "Missed call")
-                Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
-                LightText(text = peerLabel(entry.peer), variant = LightTextVariant.Copy)
-            }
-        } else {
-            LightText(text = peerLabel(entry.peer), variant = LightTextVariant.Copy)
+        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+        Row(verticalAlignment = Alignment.Bottom) {
+            LightIcon(
+                icon = if (entry.missed) LightIcons.CALL_MISSED else LightIcons.CALL,
+                // The handset glyph ends ~10px above its box bottom (vector
+                // padding) while digits end at the descent line — nudge the
+                // icon down so the glyph's bottom sits on the text's bottom.
+                modifier = Modifier.offset(y = 0.3f.gridUnitsAsDp()),
+                contentDescription = if (entry.missed) "Missed call" else null,
+            )
+            Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
+            LightText(text = formatPeer(entry.peer), variant = LightTextVariant.Copy)
         }
+        LightText(text = formatDuration(entry.duration), variant = LightTextVariant.Superfine)
     }
+}
+
+/** Native duration rendering: "0m 16s", "2m 05s", "0s" for unanswered. */
+internal fun formatDuration(seconds: Long): String {
+    if (seconds == 0L) return "0s"
+    val m = seconds / 60
+    val s = seconds % 60
+    return "${m}m ${s.toString().padStart(2, '0')}s"
 }
 
 /** A stored peer JID ("49…@s.whatsapp.net" or bare number) as a number. */
 internal fun peerLabel(peer: String): String = peer.substringBefore('@')
+
+/** Render a peer the way the native Phone does — an international
+ *  "+cc number" layout (PhoneNumberUtils; E.164 input needs no region) —
+ *  falling back to "+" + digits for ids that aren't real numbers (LIDs). */
+internal fun formatPeer(peer: String): String {
+    val digits = peerLabel(peer).filter { it.isDigit() }
+    if (digits.isEmpty()) return peer
+    return PhoneNumberUtils.formatNumber("+$digits", Locale.getDefault().country)
+        ?: "+$digits"
+}
 
 private fun formatAt(at: Long): String =
     Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault())

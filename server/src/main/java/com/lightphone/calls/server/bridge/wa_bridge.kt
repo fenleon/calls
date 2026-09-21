@@ -770,6 +770,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -790,6 +792,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 fun uniffi_wa_bridge_checksum_method_wabridge_accept_call(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_account(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_logout(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_place_call(
 ): Short
@@ -875,6 +879,8 @@ fun uniffi_wa_bridge_fn_method_wabridge_accept_call(`ptr`: Pointer,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_account(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_wa_bridge_fn_method_wabridge_logout(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_place_call(`ptr`: Pointer,`phoneOrJid`: RustBuffer.ByValue,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_recv_playout_pcm(`ptr`: Pointer,`timeoutMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1032,6 +1038,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_account() != 46385.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_logout() != 42824.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_place_call() != 38868.toShort()) {
@@ -1333,6 +1342,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1521,6 +1553,18 @@ public interface WaBridgeInterface {
      * session via the device snapshot. `None` before pairing.
      */
     fun `account`(): kotlin.String?
+    
+    /**
+     * User-initiated unpair: deregister the device with the server
+     * (`Client::logout` sends the remove-companion IQ, so the entry
+     * disappears from the primary's "Linked devices" list) and then wipe
+     * the store + respawn exactly like `reset_session`. The IQ is
+     * best-effort — offline it degrades to the local wipe, same recovery
+     * behavior as an unpaired-timeout. The `LoggedOut` the deregistration
+     * fires is suppressed (`unlinking`): the caller parked the UI on
+     * `NeedPairing` and owns the teardown.
+     */
+    fun `logout`()
     
     /**
      * Places a 1:1 call. `phone_or_jid` is a bare phone number (an E.164
@@ -1730,6 +1774,28 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     }
     )
     }
+    
+
+    
+    /**
+     * User-initiated unpair: deregister the device with the server
+     * (`Client::logout` sends the remove-companion IQ, so the entry
+     * disappears from the primary's "Linked devices" list) and then wipe
+     * the store + respawn exactly like `reset_session`. The IQ is
+     * best-effort — offline it degrades to the local wipe, same recovery
+     * behavior as an unpaired-timeout. The `LoggedOut` the deregistration
+     * fires is suppressed (`unlinking`): the caller parked the UI on
+     * `NeedPairing` and owns the teardown.
+     */
+    @Throws(WaException::class)override fun `logout`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_logout(
+        it, _status)
+}
+    }
+    
     
 
     
@@ -1986,6 +2052,94 @@ public object FfiConverterTypeWaBridge: FfiConverter<WaBridge, Pointer> {
 
 
 
+/**
+ * One imported call-log record; maps 1:1 onto the engine's `CallLogEntry`.
+ */
+data class WaCallRecord (
+    var `peer`: kotlin.String, 
+    /**
+     * Start time, epoch millis.
+     */
+    var `at`: kotlin.ULong, 
+    var `outgoing`: kotlin.Boolean, 
+    var `missed`: kotlin.Boolean, 
+    /**
+     * Connected duration in seconds (0 for unanswered calls).
+     */
+    var `duration`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWaCallRecord: FfiConverterRustBuffer<WaCallRecord> {
+    override fun read(buf: ByteBuffer): WaCallRecord {
+        return WaCallRecord(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WaCallRecord) = (
+            FfiConverterString.allocationSize(value.`peer`) +
+            FfiConverterULong.allocationSize(value.`at`) +
+            FfiConverterBoolean.allocationSize(value.`outgoing`) +
+            FfiConverterBoolean.allocationSize(value.`missed`) +
+            FfiConverterULong.allocationSize(value.`duration`)
+    )
+
+    override fun write(value: WaCallRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`peer`, buf)
+            FfiConverterULong.write(value.`at`, buf)
+            FfiConverterBoolean.write(value.`outgoing`, buf)
+            FfiConverterBoolean.write(value.`missed`, buf)
+            FfiConverterULong.write(value.`duration`, buf)
+    }
+}
+
+
+
+/**
+ * A peer JID and its push name (empty when unknown).
+ */
+data class WaContact (
+    var `id`: kotlin.String, 
+    var `name`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWaContact: FfiConverterRustBuffer<WaContact> {
+    override fun read(buf: ByteBuffer): WaContact {
+        return WaContact(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WaContact) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`name`)
+    )
+
+    override fun write(value: WaContact, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`name`, buf)
+    }
+}
+
+
+
 
 
 sealed class WaException: kotlin.Exception() {
@@ -2167,6 +2321,24 @@ sealed class WaEvent {
         companion object
     }
     
+    /**
+     * Call-log backfill from the pairing history sync
+     * (`HistorySync.callLogRecords`) — the same history web.whatsapp shows.
+     */
+    data class CallLogImport(
+        val `entries`: List<WaCallRecord>) : WaEvent() {
+        companion object
+    }
+    
+    /**
+     * Names + numbers of everyone the account has interacted with
+     * (history-sync pushnames + conversation JIDs). Never message content.
+     */
+    data class ContactsImport(
+        val `contacts`: List<WaContact>) : WaEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2202,6 +2374,12 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 )
             10 -> WaEvent.MissedCall(
                 FfiConverterString.read(buf),
+                )
+            11 -> WaEvent.CallLogImport(
+                FfiConverterSequenceTypeWaCallRecord.read(buf),
+                )
+            12 -> WaEvent.ContactsImport(
+                FfiConverterSequenceTypeWaContact.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2276,6 +2454,20 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 + FfiConverterString.allocationSize(value.`peer`)
             )
         }
+        is WaEvent.CallLogImport -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceTypeWaCallRecord.allocationSize(value.`entries`)
+            )
+        }
+        is WaEvent.ContactsImport -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceTypeWaContact.allocationSize(value.`contacts`)
+            )
+        }
     }
 
     override fun write(value: WaEvent, buf: ByteBuffer) {
@@ -2326,6 +2518,16 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             is WaEvent.MissedCall -> {
                 buf.putInt(10)
                 FfiConverterString.write(value.`peer`, buf)
+                Unit
+            }
+            is WaEvent.CallLogImport -> {
+                buf.putInt(11)
+                FfiConverterSequenceTypeWaCallRecord.write(value.`entries`, buf)
+                Unit
+            }
+            is WaEvent.ContactsImport -> {
+                buf.putInt(12)
+                FfiConverterSequenceTypeWaContact.write(value.`contacts`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2443,6 +2645,62 @@ public object FfiConverterSequenceShort: FfiConverterRustBuffer<List<kotlin.Shor
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterShort.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeWaCallRecord: FfiConverterRustBuffer<List<WaCallRecord>> {
+    override fun read(buf: ByteBuffer): List<WaCallRecord> {
+        val len = buf.getInt()
+        return List<WaCallRecord>(len) {
+            FfiConverterTypeWaCallRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WaCallRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWaCallRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WaCallRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWaCallRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeWaContact: FfiConverterRustBuffer<List<WaContact>> {
+    override fun read(buf: ByteBuffer): List<WaContact> {
+        val len = buf.getInt()
+        return List<WaContact>(len) {
+            FfiConverterTypeWaContact.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WaContact>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWaContact.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WaContact>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWaContact.write(it, buf)
         }
     }
 }

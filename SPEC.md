@@ -4,6 +4,8 @@
 **Status:** spec only — no code yet. Date: 2026-09-19.
 **Foundation:** [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust) v0.7, `voip` feature — the only open-source WhatsApp client with a working full call media path (audio: PR #918; video: PR #1024; group calls/call links: PR #1130 — **excluded from v1**). License: MIT. API facts below are taken from the library's own [VoIP guide](https://oxidezap.github.io/whatsapp-rust/guides/voip-calls), not guessed.
 
+**Local fork:** builds patch `whatsapp-rust`/`wacore` to `rust/whatsapp-rust/` — a clone of [fenleon/whatsapp-rust](https://github.com/fenleon/whatsapp-rust) (branch `call-log-sync`: call-log app-state records surfaced as `CallLogUpdate` events, not upstream). Not committed here (gitignored): `git clone -b call-log-sync https://github.com/fenleon/whatsapp-rust rust/whatsapp-rust` before the first Rust build.
+
 ## 0. Product shape & non-goals
 
 A calm, native-feeling call tool: pair once, see a call log, answer calls, place calls, (later) upgrade to video. Everything else is out.
@@ -115,8 +117,11 @@ Screens (all `LightScreen`/`LightScreenViewModel`; toolbox launch; `@InitialScre
 - **Active call** — peer, duration, mute toggle, speaker toggle, hang up; video (M3) adds start/stop video + accept-upgrade prompt when `VideoStateChanged` arrives with `is_upgrade_request()`.
 - **Incoming call** — full-screen answer/decline. All call states (**connecting / connected / incoming**) share one screen design, matching the native Phone tool (`call-active/call-connected/call-incoming.png`): lowercase status line ("connecting…" / "connected" / "incoming…") above a large centered peer name (raw formatted number when unknown), icon toggle row with underline = active, hang-up × centered at bottom (incoming: × decline bottom-left, △ answer bottom-right).
 - **Settings** — paired-account status, logout, audio-route default, diagnostics toggle (opt-in verbose logging).
+- **Errors** — any call-screen failure ("call failed", "could not answer", "mute failed") flashes the native error display: fullscreen black with the centered status-line style (Copy, lighten), auto-dismissed after ~1.5 s (`ErrorFlash`), never an inline text or Android toast.
 
-Design pass via the `lightos-design` skill at end of each implementation session.
+Panel-by-panel geometry + exact wording: `PHONE-PANELS.md` (extracted from the native
+Phone captures + LightOS Hermes bundle, 2026-09-20). Design pass via the `lightos-design`
+skill at end of each implementation session.
 
 ## 5. Testing
 

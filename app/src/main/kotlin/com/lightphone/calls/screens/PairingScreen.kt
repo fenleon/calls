@@ -110,7 +110,9 @@ class PairingScreen(
                 )
                 Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
                 Box(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
                     contentAlignment = Alignment.Center,
                 ) {
                     qrPayload?.let { payload ->

@@ -12,6 +12,12 @@ whatsapp-rust = { version = "0.7", features = ["voip"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 uniffi = { version = "0.29", features = ["cli"] }
 
+# Local fork: call-log app-state mutations surfaced as CallLogUpdate events
+# (upstream drop); branch `call-log-sync`, see calls WORKLOG.
+[patch.crates-io]
+whatsapp-rust = { path = "../whatsapp-rust" }
+wacore = { path = "../whatsapp-rust/wacore" }
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"

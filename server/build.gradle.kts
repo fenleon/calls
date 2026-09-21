@@ -40,6 +40,9 @@ dependencies {
         exclude(group = "com.google.mlkit")
         exclude(group = "androidx.camera")
     }
+    // LightBluetooth (BT state the call screen's toggle renders); classes are
+    // on the runtime classpath via the app's sdk-client dependency.
+    compileOnly(libs.sdk.client)
     implementation(libs.kotlinx.coroutines)
     implementation(libs.kotlinx.serialization.json)
     testImplementation(libs.kotlin.test)

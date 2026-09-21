@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use whatsapp_rust::prelude::{Bot, BotHandle, Client, SqliteStore};
+use whatsapp_rust::prelude::wa;
 use whatsapp_rust::types::call::{CallAction, ElsewhereOutcome, IncomingCall};
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::voip::CallHandle;
@@ -34,6 +35,31 @@ pub enum WaEvent {
     CallStarted { call_id: String },
     CallEnded { reason: String },
     MissedCall { peer: String },
+    /// Call-log backfill from the pairing history sync
+    /// (`HistorySync.callLogRecords`) — the same history web.whatsapp shows.
+    CallLogImport { entries: Vec<WaCallRecord> },
+    /// Names + numbers of everyone the account has interacted with
+    /// (history-sync pushnames + conversation JIDs). Never message content.
+    ContactsImport { contacts: Vec<WaContact> },
+}
+
+/// One imported call-log record; maps 1:1 onto the engine's `CallLogEntry`.
+#[derive(Clone, uniffi::Record)]
+pub struct WaCallRecord {
+    pub peer: String,
+    /// Start time, epoch millis.
+    pub at: u64,
+    pub outgoing: bool,
+    pub missed: bool,
+    /// Connected duration in seconds (0 for unanswered calls).
+    pub duration: u64,
+}
+
+/// A peer JID and its push name (empty when unknown).
+#[derive(uniffi::Record)]
+pub struct WaContact {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, uniffi::Error)]
@@ -135,6 +161,12 @@ pub struct WaBridge {
     /// generation is superseded (otherwise aborted bots' watchdogs fire
     /// spurious restarts 30 s later).
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while a user-initiated `logout` is in flight: the deregistration
+    /// triggers `LoggedOut`, which maps to `Unlinked` — but the surface drove
+    /// the teardown itself (wipe + respawn), so that event must be suppressed
+    /// (the engine's `Unlinked` recovery would double-respawn and burn an
+    /// auto-restart).
+    unlinking: Arc<std::sync::atomic::AtomicBool>,
     /// Own JID as the UI renders it ("Paired as …"). Never logged.
     account: Arc<Mutex<Option<String>>>,
     /// Microphone push channel, bounded so a stalled engine can never block
@@ -314,6 +346,7 @@ impl WaBridge {
             handle: Mutex::new(None),
             db_path: Mutex::new(None),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            unlinking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             account: Arc::new(Mutex::new(None)),
             mic_tx,
             mic_rx,
@@ -376,6 +409,45 @@ impl WaBridge {
         }
         self.spawn_bot(&db_path)
     }
+
+    /// User-initiated unpair: deregister the device with the server
+    /// (`Client::logout` sends the remove-companion IQ, so the entry
+    /// disappears from the primary's "Linked devices" list) and then wipe
+    /// the store + respawn exactly like `reset_session`. The IQ is
+    /// best-effort — offline it degrades to the local wipe, same recovery
+    /// behavior as an unpaired-timeout. The `LoggedOut` the deregistration
+    /// fires is suppressed (`unlinking`): the caller parked the UI on
+    /// `NeedPairing` and owns the teardown.
+    pub fn logout(&self) -> Result<(), WaError> {
+        let db_path = self
+            .db_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        let handle = self.handle.lock().unwrap().take();
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.account.lock().unwrap() = None;
+        self.unlinking
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The IQ needs a live connection — keep the run loop alive while
+        // `logout` runs; dropping the handle aborts it afterwards.
+        if let Some(handle) = handle {
+            let client = handle.client();
+            let runtime = self.runtime.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime")
+            });
+            runtime.block_on(client.logout());
+            drop(handle);
+        }
+        if let Some(dir) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        self.spawn_bot(&db_path)
+    }
 }
 
 impl WaBridge {
@@ -398,6 +470,7 @@ impl WaBridge {
         let event_tx = self.events.clone();
         let qr_tx = self.events.clone();
         let account = self.account.clone();
+        let unlinking = self.unlinking.clone();
         let incoming = self.incoming.clone();
         let ended_emitted = self.ended_emitted.clone();
         let outgoing_ringing = self.outgoing_ringing.clone();
@@ -432,6 +505,7 @@ impl WaBridge {
                 .on_event(move |event: Arc<Event>, client: Arc<Client>| {
                     let tx = event_tx.clone();
                     let account = account.clone();
+                    let unlinking = unlinking.clone();
                     let incoming = incoming.clone();
                     let ended_emitted = ended_emitted.clone();
                     let outgoing_ringing = outgoing_ringing.clone();
@@ -445,9 +519,15 @@ impl WaBridge {
                             return;
                         }
                         // The primary revoked the link: the stored identity is
-                        // dead — drop it so `account()` reports unpaired.
+                        // dead — drop it so `account()` reports unpaired. A
+                        // user-initiated logout fires the same event: there the
+                        // surface drove the teardown itself, so `Unlinked` is
+                        // suppressed (see the `unlinking` field).
                         if matches!(event.as_ref(), Event::LoggedOut(_)) {
                             *account.lock().unwrap() = None;
+                            if unlinking.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
                         }
                         // Keep the newest unanswered 1:1 offer for accept/reject;
                         // a peer cancel ends the ring. A missed-call notice or an
@@ -485,6 +565,69 @@ impl WaBridge {
                             Event::MissedCall(_) | Event::CallEndedElsewhere(_)
                         ) {
                             *incoming.lock().unwrap() = None;
+                        }
+                        // Live call-log records + push-name updates (app-state
+                        // patches) keep the log and contacts current after the
+                        // pairing-time history-sync import.
+                        if let Event::CallLogUpdate(u) = &*event {
+                            let r = u.action.as_ref();
+                            let own = own_jids(&client);
+                            let raw = if one_to_one_record(r) {
+                                record_peer_jid(r, &own)
+                            } else {
+                                None
+                            };
+                            if let Some(raw) = raw {
+                                let peer = resolve_jid(&client, raw).await;
+                                if let Some(record) = call_record_to_wa(r, peer) {
+                                    let _ = tx.send(WaEvent::CallLogImport {
+                                        entries: vec![record.clone()],
+                                    });
+                                    // The peer enters the contact list with the
+                                    // call — no re-pair needed to grow it. Empty
+                                    // name: a pushname update fills it later
+                                    // (merge never lets "" overwrite a name).
+                                    let _ = tx.send(WaEvent::ContactsImport {
+                                        contacts: vec![WaContact {
+                                            id: record.peer,
+                                            name: String::new(),
+                                        }],
+                                    });
+                                }
+                            }
+                            return;
+                        }
+                        if let Event::PushNameUpdate(u) = &*event {
+                            let name = u.new_push_name.trim();
+                            if !name.is_empty() {
+                                let id = resolve_jid(&client, u.jid.to_string()).await;
+                                let _ = tx.send(WaEvent::ContactsImport {
+                                    contacts: vec![WaContact {
+                                        id,
+                                        name: name.to_string(),
+                                    }],
+                                });
+                            }
+                            return;
+                        }
+                        // Call-log + contacts backfill rides in on the pairing
+                        // history sync. Parsed once (inflate + decode is
+                        // heavy); nothing else in the blob is used.
+                        if let Event::HistorySync(hs) = &*event {
+                            // PUSH_NAME chunks (type 4) carry no call records,
+                            // but they DO carry the pushnames the contacts
+                            // import needs — decode them too (once, at pairing).
+                            if let Some(parsed) = hs.get() {
+                                let mut own = Vec::new();
+                                if let Some(pn) = client.pn() {
+                                    own.push(pn.to_string());
+                                }
+                                if let Some(lid) = client.lid() {
+                                    own.push(lid.to_string());
+                                }
+                                import_history(&own, parsed, &tx);
+                            }
+                            return;
                         }
                         // F2: resolve the peer display before emitting — the
                         // offer's server-provided `caller_pn` when present,
@@ -995,6 +1138,127 @@ fn map_event(event: &Event, resolved_peer: Option<&str>) -> Option<WaEvent> {
     }
 }
 
+/// The account's own JID strings (pn + lid) — records list us among
+/// participants for outgoing calls.
+fn own_jids(client: &Client) -> Vec<String> {
+    [client.pn(), client.lid()]
+        .into_iter()
+        .flatten()
+        .map(|j| j.to_string())
+        .collect()
+}
+
+/// True for a 1:1 regular call record — group calls and call links are out
+/// of scope (SPEC). An absent call_type is the proto default = REGULAR.
+fn one_to_one_record(r: &wa::CallLogRecord) -> bool {
+    !r.call_type
+        .is_some_and(|t| !matches!(t, whatsapp_rust::waproto::whatsapp::call_log_record::CallType::REGULAR))
+        && r.group_jid.is_none()
+        && !r.is_call_link.unwrap_or(false)
+}
+
+/// Peer = creator (incoming) or the non-us participant (outgoing); either
+/// way: the first candidate that isn't us.
+fn record_peer_jid(r: &wa::CallLogRecord, own: &[String]) -> Option<String> {
+    let candidate = if r.is_incoming.unwrap_or(false) {
+        r.call_creator_jid.clone()
+    } else {
+        None
+    };
+    let mut candidates = candidate.into_iter().collect::<Vec<_>>();
+    candidates.extend(r.participants.iter().filter_map(|p| p.user_jid.clone()));
+    candidates.into_iter().find(|j| !own.contains(j))
+}
+
+fn call_record_to_wa(r: &wa::CallLogRecord, peer: String) -> Option<WaCallRecord> {
+    use whatsapp_rust::waproto::whatsapp::call_log_record::CallResult;
+    let start = *r.start_time.as_ref()? as u64;
+    Some(WaCallRecord {
+        peer,
+        at: start * 1000,
+        outgoing: !r.is_incoming.unwrap_or(false),
+        // CONNECTED is the proto3 default (0), so the server omits it for
+        // connected calls — an absent result IS a connected call (verified:
+        // known-connected records all arrive without the field). Only an
+        // explicit non-connected, non-answered-elsewhere result is missed.
+        missed: !matches!(
+            r.call_result,
+            None | Some(CallResult::CONNECTED) | Some(CallResult::ACCEPTEDELSEWHERE)
+        ),
+        duration: r.duration.unwrap_or(0).max(0) as u64,
+    })
+}
+
+/// LID → phone JID through the client's local mapping cache (no network);
+/// anything that isn't a LID passes through unchanged.
+async fn resolve_jid(client: &Client, jid: String) -> String {
+    let Ok(parsed) = jid.parse::<Jid>() else { return jid };
+    if !parsed.is_lid() {
+        return jid;
+    }
+    match client.get_lid_pn_entry(&parsed).await {
+        Ok(Some(entry)) => format!("{}@s.whatsapp.net", entry.phone_number),
+        _ => jid,
+    }
+}
+
+/// Extracts call-log records + peer contacts from a decoded history-sync blob
+/// and emits them as import events. `own` lists our own JID strings so a
+/// record's participant list can drop us (outgoing calls list us as creator).
+/// Only peer JIDs, names, and call metadata leave the blob — never messages.
+fn import_history(
+    own: &[String],
+    hs: &whatsapp_rust::waproto::whatsapp::HistorySync,
+    tx: &mpsc::Sender<WaEvent>,
+) {
+    // LID → phone JID: real numbers beat bare LIDs in the log.
+    let pn_of: std::collections::HashMap<&str, &str> = hs
+        .phone_number_to_lid_mappings
+        .iter()
+        .filter_map(|m| Some((m.lid_jid.as_deref()?, m.pn_jid.as_deref()?)))
+        .collect();
+    let resolve = |jid: String| -> String {
+        pn_of.get(jid.as_str()).map(|pn| (*pn).to_string()).unwrap_or(jid)
+    };
+
+    let entries: Vec<WaCallRecord> = hs
+        .call_log_records
+        .iter()
+        .filter(|r| one_to_one_record(r))
+        .filter_map(|r| {
+            let peer = record_peer_jid(r, own)?;
+            call_record_to_wa(r, resolve(peer))
+        })
+        .collect();
+    if !entries.is_empty() {
+        let _ = tx.send(WaEvent::CallLogImport { entries });
+    }
+
+    // Contacts: pushnames carry the name, conversations carry the peer set.
+    // 1:1 JIDs only — groups and broadcast lists stay out.
+    let mut contacts: Vec<WaContact> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |id: String, name: String, seen: &mut std::collections::HashSet<String>| {
+        if !id.contains('@') || id.ends_with("@g.us") || id.starts_with("status@") || id.ends_with("@broadcast") {
+            return;
+        }
+        if seen.insert(id.clone()) {
+            contacts.push(WaContact { id: resolve(id), name });
+        }
+    };
+    for p in &hs.pushnames {
+        if let (Some(id), Some(name)) = (p.id.as_ref(), p.pushname.as_ref()) {
+            push(id.clone(), name.clone(), &mut seen);
+        }
+    }
+    for c in &hs.conversations {
+        push(c.id.clone(), String::new(), &mut seen);
+    }
+    if !contacts.is_empty() {
+        let _ = tx.send(WaEvent::ContactsImport { contacts });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1275,108 @@ mod tests {
     #[test]
     fn version_is_set() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn history_sync_import_maps_records_and_contacts() {
+        use whatsapp_rust::waproto::whatsapp::{
+            call_log_record::{CallResult, CallType, ParticipantInfo},
+            CallLogRecord, Conversation, HistorySync, PhoneNumberToLIDMapping, Pushname,
+        };
+        let (tx, rx) = mpsc::channel();
+        let hs = HistorySync {
+            phone_number_to_lid_mappings: vec![PhoneNumberToLIDMapping {
+                pn_jid: Some("15550000000@s.whatsapp.net".into()),
+                lid_jid: Some("1000000000@lid".into()),
+            }],
+            call_log_records: vec![
+                CallLogRecord {
+                    call_creator_jid: Some("1000000000@lid".into()),
+                    start_time: Some(1_700_000_000),
+                    duration: Some(16),
+                    is_incoming: Some(true),
+                    call_result: Some(CallResult::CONNECTED),
+                    call_type: Some(CallType::REGULAR),
+                    participants: vec![ParticipantInfo {
+                        user_jid: Some("1000000000@lid".into()),
+                        call_result: None,
+                    }],
+                    ..Default::default()
+                },
+                // The connected-call wire shape: the server omits callResult
+                // (proto3 default 0 = CONNECTED) — must not read as missed.
+                CallLogRecord {
+                    call_creator_jid: Some("1000000000@lid".into()),
+                    start_time: Some(1_700_050_000),
+                    is_incoming: Some(true),
+                    call_type: Some(CallType::REGULAR),
+                    participants: vec![ParticipantInfo {
+                        user_jid: Some("1000000000@lid".into()),
+                        call_result: None,
+                    }],
+                    ..Default::default()
+                },
+                CallLogRecord {
+                    call_creator_jid: Some("15551234567@s.whatsapp.net".into()), // us
+                    start_time: Some(1_700_100_000),
+                    is_incoming: Some(false),
+                    call_result: Some(CallResult::MISSED),
+                    participants: vec![ParticipantInfo {
+                        user_jid: Some("4915112345678@s.whatsapp.net".into()),
+                        call_result: None,
+                    }],
+                    ..Default::default()
+                },
+                // Group call — must be dropped.
+                CallLogRecord {
+                    call_creator_jid: Some("1000000000@lid".into()),
+                    start_time: Some(1_700_200_000),
+                    group_jid: Some("1203...@g.us".into()),
+                    ..Default::default()
+                },
+            ],
+            pushnames: vec![Pushname {
+                id: Some("4915112345678@s.whatsapp.net".into()),
+                pushname: Some("Fenn".into()),
+            }],
+            conversations: vec![
+                Conversation {
+                    id: "4915112345678@s.whatsapp.net".into(),
+                    ..Default::default()
+                },
+                Conversation {
+                    id: "status@broadcast".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let own = ["15551234567@s.whatsapp.net".to_string()];
+        import_history(&own, &hs, &tx);
+        drop(tx);
+        let got: Vec<WaEvent> = rx.iter().collect();
+        let log = got.iter().find_map(|e| match e {
+            WaEvent::CallLogImport { entries } => Some(entries.clone()),
+            _ => None,
+        })
+        .expect("call log import emitted");
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].peer, "15550000000@s.whatsapp.net"); // LID resolved to PN
+        assert_eq!(log[0].at, 1_700_000_000_000);
+        assert_eq!(log[0].duration, 16);
+        assert!(!log[0].outgoing && !log[0].missed);
+        // Absent callResult (proto3 default = CONNECTED) → not missed.
+        assert!(!log[1].missed);
+        assert_eq!(log[2].peer, "4915112345678@s.whatsapp.net"); // us dropped from participants
+        assert!(log[2].outgoing && log[2].missed);
+        let contacts = got.iter().find_map(|e| match e {
+            WaEvent::ContactsImport { contacts } => Some(contacts.clone()),
+            _ => None,
+        })
+        .expect("contacts import emitted");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, "4915112345678@s.whatsapp.net");
+        assert_eq!(contacts[0].name, "Fenn");
     }
 
     #[test]

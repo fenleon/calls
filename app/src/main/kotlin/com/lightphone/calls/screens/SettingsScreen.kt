@@ -10,6 +10,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewModelScope
@@ -44,6 +47,9 @@ class SettingsViewModel : LightViewModel<Unit>() {
                 when (event) {
                     is WaEvent.Paired -> account.value = WaCallEngine.account()
                     is WaEvent.Unlinked -> account.value = null
+                    // Unpair parks the flow here until the respawn — already
+                    // unpaired as far as the UI is concerned.
+                    is WaEvent.NeedPairing -> account.value = null
                     else -> Unit
                 }
             }
@@ -53,6 +59,13 @@ class SettingsViewModel : LightViewModel<Unit>() {
     /** Connect: restart the pairing flow for a fresh QR set, then let the
      *  pairing screen observe the new `PairingQr` rotations. */
     fun connect() = WaCallEngine.restartPairing()
+
+    /** Unpair: deregister with WhatsApp, wipe the session, respawn — back
+     *  to the same state as never having paired. */
+    fun unpair() = WaCallEngine.unpair()
+
+    /** Dev design aid: fake incoming call (see [WaCallEngine.debugIncomingCall]). */
+    fun debugIncomingCall() = WaCallEngine.debugIncomingCall()
 }
 
 /** Account status. The pairing itself stays event-driven (the engine emits
@@ -72,6 +85,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val account by viewModel.account.collectAsState()
         val engineError by viewModel.engineError.collectAsState()
         val version by viewModel.version.collectAsState()
+        var versionTaps by remember { mutableStateOf(0) }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -119,10 +133,51 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                         Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
                         LightText(text = message, variant = LightTextVariant.Detail)
                     }
+                    account?.let { paired ->
+                        // Two-tap confirm (no long-press on the LP3): the row
+                        // arms on the first tap and acts on the second.
+                        var confirmUnpair by remember { mutableStateOf(false) }
+                        LaunchedEffect(account) { confirmUnpair = false }
+                        Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .lightClickable(
+                                    onClick = {
+                                        if (confirmUnpair) {
+                                            viewModel.unpair()
+                                        } else {
+                                            confirmUnpair = true
+                                        }
+                                    },
+                                ),
+                        ) {
+                            LightText(
+                                text = if (confirmUnpair) "Tap again to unpair" else "Unpair",
+                                variant = LightTextVariant.Heading,
+                            )
+                            Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+                            LightText(
+                                text = if (confirmUnpair) "$paired will be unlinked from your phone"
+                                else "Unlink this device and erase its session",
+                                variant = LightTextVariant.Detail,
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.weight(1f))
                     LightText(
                         text = "wa-bridge $version",
                         variant = LightTextVariant.Detail,
+                        // Dev design aid: five taps fire a fake incoming
+                        // call — ring/active panels render with no bridge,
+                        // no network, no audio, no log entries.
+                        modifier = Modifier.lightClickable {
+                            versionTaps += 1
+                            if (versionTaps >= 5) {
+                                versionTaps = 0
+                                viewModel.debugIncomingCall()
+                            }
+                        },
                     )
                     Spacer(modifier = Modifier.padding(bottom = 1f.gridUnitsAsDp()))
                 }

@@ -14,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.lifecycle.viewModelScope
+import com.lightphone.calls.server.ContactEntry
 import com.lightphone.calls.server.WaCallEngine
 import com.lightphone.calls.server.bridge.WaEvent
 import com.thelightphone.sdk.LightScreen
@@ -35,24 +36,35 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 class ContactsViewModel : LightViewModel<Unit>() {
-    /** Distinct peers from the call log, alphabetical. The bridge has no
-     *  contacts API yet — these are the people the account has called. */
-    val peers = MutableStateFlow<List<String>>(emptyList())
+    /** Distinct peers, named when the history sync knew a push name —
+     *  alphabetical, unnamed numbers last. */
+    val peers = MutableStateFlow<List<ContactEntry>>(emptyList())
 
     init {
         refresh()
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
-                if (event is WaEvent.CallEnded || event is WaEvent.MissedCall) refresh()
+                if (event is WaEvent.CallEnded ||
+                    event is WaEvent.MissedCall ||
+                    event is WaEvent.CallLogImport ||
+                    event is WaEvent.ContactsImport
+                ) {
+                    refresh()
+                }
             }
         }
     }
 
     private fun refresh() {
-        peers.value = WaCallEngine.callLogEntries()
-            .map { peerLabel(it.peer) }
-            .distinct()
-            .sorted()
+        // Imported contacts carry the names; call-log-only peers join so a
+        // number without a history-sync name still shows.
+        val byId = WaCallEngine.callLogEntries()
+            .map { ContactEntry(id = it.peer, name = "") }
+            .plus(WaCallEngine.contactEntries())
+            .associateBy { it.id }
+        peers.value = byId.values.sortedWith(
+            compareBy({ it.name.isEmpty() }, { it.name.lowercase() }, { it.id }),
+        )
     }
 }
 
@@ -99,20 +111,23 @@ class ContactsScreen(sealedActivity: SealedLightActivity) :
                     }
                 } else {
                     LightScrollView(modifier = Modifier.weight(1f)) {
-                        peers.forEach { peer ->
+                        peers.forEach { contact ->
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .lightClickable(
                                         onClick = {
                                             navigateTo(screenFactory = { activity ->
-                                                DialScreen(activity, peer)
+                                                DialScreen(activity, contact.id)
                                             })
                                         },
                                     )
                                     .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
                             ) {
-                                LightText(text = peer, variant = LightTextVariant.Copy)
+                                LightText(
+                                    text = contact.name.ifEmpty { formatPeer(contact.id) },
+                                    variant = LightTextVariant.Copy,
+                                )
                             }
                         }
                     }

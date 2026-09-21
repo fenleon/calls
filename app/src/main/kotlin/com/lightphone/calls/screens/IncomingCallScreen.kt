@@ -6,11 +6,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -50,7 +54,7 @@ class IncomingCallViewModel : LightViewModel<Unit>() {
                     // screen (observed below); on failure stay and say so.
                     WaCallEngine.acceptCall()
                 } catch (e: Exception) {
-                    error.value = "Could not answer"
+                    error.value = "could not answer"
                     busy.value = false
                 }
             } else {
@@ -79,14 +83,20 @@ class IncomingCallScreen(
         val busy by viewModel.busy.collectAsState()
         val error by viewModel.error.collectAsState()
         val permissionRequestTick by viewModel.permissionRequestTick.collectAsState()
+        // Peer gave up (CallEnded): flash the native "call ended" panel
+        // before the log returns (PHONE-PANELS.md §5.3).
+        var ended by remember { mutableStateOf(false) }
         val permissionLauncher = rememberPermissionRequestLauncher(Manifest.permission.RECORD_AUDIO)
 
-        // The peer gave up (CallEnded) or the call came up elsewhere: back to
-        // the call log. CallStarted routes to the active call via home.
+        // The call coming up (accept → `CallStarted`) is routed by home's
+        // always-alive ViewModel via `LightGlobalRoute` (clearToRoot — this
+        // panel is replaced by the active-call screen); a caller cancel or
+        // expiry arrives as `MissedCall`, never `CallEnded` — close quietly.
         LaunchedEffect(Unit) {
             WaCallEngine.events.collect { event ->
                 when (event) {
-                    is WaEvent.CallStarted, is WaEvent.CallEnded -> goBack()
+                    is WaEvent.MissedCall -> if (event.peer == peer) goBack()
+                    is WaEvent.CallEnded -> ended = true
                     else -> Unit
                 }
             }
@@ -95,32 +105,45 @@ class IncomingCallScreen(
             if (permissionRequestTick > 0) permissionLauncher?.launch()
         }
 
-        // Native Phone incoming grammar (reference/lp3/screens/phone/
-        // call-incoming.png): "incoming…" status line above a large centered
-        // peer; × decline bottom-left, answer bottom-right. (Native uses a
-        // triangle for answer; the SDK icon set has the handset instead.)
+        // Native Phone incoming grammar (calls/PHONE-PANELS.md §1/§5):
+        // "incoming..." status line (copy, lighten) above the peer
+        // (subtitle/heading adaptive; the native passes truncateTitle:false —
+        // no truncation here); × decline bottom-left, △ accept bottom-right
+        // (the SDK's ACCEPT glyph is the native's own drawable).
         LightTheme(colors = themeColors) {
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    // Native call-screen geometry (call-incoming.xml): the
+                    // status line's top lands at 384 px — pinned from the top
+                    // rather than centered so the peer sits where the native
+                    // puts it (peer top 547).
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(top = 12.2f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
                         LightText(
-                            text = "incoming…",
-                            variant = LightTextVariant.Superfine,
+                            text = "incoming...",
+                            variant = LightTextVariant.Copy,
                         )
-                        Spacer(modifier = Modifier.padding(top = 1f.gridUnitsAsDp()))
-                        LightText(text = peerLabel(peer), variant = LightTextVariant.Title)
-                        error?.let { message ->
-                            Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                            LightText(
-                                text = message,
-                                variant = LightTextVariant.Superfine,
-                                align = TextAlign.Center,
-                            )
-                        }
+                        Spacer(modifier = Modifier.padding(top = 2.73f.gridUnitsAsDp()))
+                        LightText(
+                            text = formatPeer(peer),
+                            variant = if (formatPeer(peer).length <= PEER_FIT_CHARS) {
+                                LightTextVariant.Subtitle
+                            } else {
+                                LightTextVariant.Heading
+                            },
+                        )
                     }
                 }
                 LightBottomBar(
@@ -134,11 +157,24 @@ class IncomingCallScreen(
                             contentDescription = "Decline",
                         ),
                         LightBarButton.LightIcon(
-                            icon = LightIcons.CALL,
+                            icon = LightIcons.ACCEPT,
                             onClick = { viewModel.onAnswerTapped() },
                             contentDescription = if (busy) "Answering" else "Answer",
                         ),
                     ),
+                )
+            }
+                // Sibling of the screen Column (not a child): the flash is a
+                // true fullscreen overlay — no chrome visible around it.
+                ErrorFlash(
+                    message = if (ended) "call ended" else error,
+                    onDismiss = {
+                        if (ended) {
+                            goBack()
+                        } else {
+                            viewModel.error.value = null
+                        }
+                    },
                 )
             }
         }

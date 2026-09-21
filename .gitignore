@@ -27,3 +27,6 @@ rust/target/
 
 # Verification screenshots (never commit)
 screenshots/
+
+# Local whatsapp-rust fork clone (see SPEC.md — not part of the repo)
+rust/whatsapp-rust/

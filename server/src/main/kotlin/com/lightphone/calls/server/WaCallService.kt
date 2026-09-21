@@ -21,7 +21,14 @@ import android.util.Log
  * the call lives, earpiece↔speaker for the active-call screen's toggle.
  */
 class WaCallService : Service() {
-    override fun onCreate() { super.onCreate(); createChannel() }
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        // Bluetooth state for the call screen's toggle (permission-free;
+        // idempotent process-wide singleton — started here because the tool
+        // module can't touch Context).
+        com.thelightphone.sdk.audio.LightBluetooth.observe(this)
+    }
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null

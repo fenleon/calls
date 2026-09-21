@@ -23,6 +23,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.lifecycle.viewModelScope
 import com.lightphone.calls.server.WaCallEngine
 import com.lightphone.calls.server.bridge.WaEvent
+import com.thelightphone.sdk.LightGlobalRoute
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -44,8 +45,6 @@ import kotlinx.coroutines.launch
 
 class DialViewModel(initialNumber: String?) : LightViewModel<Unit>() {
     val number = MutableStateFlow(initialNumber ?: "")
-    val busy = MutableStateFlow(false)
-    val error = MutableStateFlow<String?>(null)
     // Increments on every tap that finds the mic ungranted, so each tap
     // re-arms the permission request even after a denial.
     val permissionRequestTick = MutableStateFlow(0)
@@ -62,22 +61,16 @@ class DialViewModel(initialNumber: String?) : LightViewModel<Unit>() {
         number.value = ""
     }
 
-    fun onCallTapped() {
-        if (busy.value || number.value.isEmpty()) return
+    /** Native grammar: the call panel opens immediately on the call tap —
+     *  it shows "connecting..." while the offer goes out, and owns the
+     *  placement, the ring wait and the "call failed" path (it routes back
+     *  here when the attempt dies). */
+    fun onCallTapped(route: () -> Unit) {
+        if (number.value.isEmpty()) return
         viewModelScope.launch {
             if (micPermissionGranted()) {
-                busy.value = true
-                error.value = null
-                try {
-                    // On success `Ringing` — or `CallStarted` directly, if
-                    // the peer answered during the offer send — routes to
-                    // the active-call screen (observed below); the glare
-                    // guard rejects a second call while one is up.
-                    WaCallEngine.placeCall(number.value)
-                } catch (e: Exception) {
-                    error.value = "Call failed"
-                    busy.value = false
-                }
+                WaCallEngine.activeScreenRouted = true
+                route()
             } else {
                 permissionRequestTick.value += 1
             }
@@ -102,36 +95,20 @@ class DialScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val number by viewModel.number.collectAsState()
-        val busy by viewModel.busy.collectAsState()
-        val error by viewModel.error.collectAsState()
         val permissionRequestTick by viewModel.permissionRequestTick.collectAsState()
         val permissionLauncher = rememberPermissionRequestLauncher(Manifest.permission.RECORD_AUDIO)
 
-        LaunchedEffect(Unit) {
-            // The outgoing call leaves the dial pad as soon as the bridge
-            // reports a state (home routes to the active-call screen):
-            // `Ringing` when the peer has not answered yet, `CallStarted`
-            // directly when the accept landed during the offer send (no
-            // ringing phase ever reported). Once-only: a second event must
-            // not pop past the active-call screen.
-            var left = false
-            WaCallEngine.events.collect { event ->
-                if (!left && (event is WaEvent.Ringing || event is WaEvent.CallStarted)) {
-                    left = true
-                    goBack()
-                }
-            }
-        }
         LaunchedEffect(permissionRequestTick) {
             if (permissionRequestTick > 0) permissionLauncher?.launch()
         }
 
         LightTheme(colors = themeColors) {
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+            Column(modifier = Modifier.fillMaxSize()) {
                 // Dialer layout: the keypad is bottom-anchored (a one-buffer
                 // gap above the bottom bar) and the typed header overlays the
                 // top — so typing never shifts the pad. `×` dismisses the
@@ -197,14 +174,6 @@ class DialScreen(
                         }
                     }
                 }
-                error?.let { message ->
-                    LightText(
-                        text = message,
-                        variant = LightTextVariant.Superfine,
-                        align = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
                 LightBottomBar(
                     items = listOf(
                         null,
@@ -218,12 +187,22 @@ class DialScreen(
                         } else {
                             LightBarButton.LightIcon(
                                 icon = LightIcons.CALL,
-                                onClick = { viewModel.onCallTapped() },
+                                onClick = {
+                                    // clearToRoot: the call panel replaces the
+                                    // dialer — hang-up then returns to the log
+                                    // (native recents), not a stale pad.
+                                    viewModel.onCallTapped {
+                                        LightGlobalRoute.push(clearToRoot = true) {
+                                            ActiveCallScreen(it, number, placeOutgoing = true)
+                                        }
+                                    }
+                                },
                                 contentDescription = "Call",
                             )
                         },
                     ),
                 )
+            }
             }
         }
     }
