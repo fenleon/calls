@@ -26,6 +26,16 @@ Next: store the callee `devices`/`ring_devices` on the `CallHandle` at attach;
 (dial → cancel while ringing → peer stops). Fallback: diff against a WhatsApp
 Web cancel wire-capture.
 
+**Test rig (from the next session):** two independent linked clients —
+the user's second WhatsApp account linked on the **LP3**, another WhatsApp
+account linked on the **emulator** — calling each other on demand. This gives
+a repeatable outgoing-cancel repro with full rust logs on the emulator side
+(`adb logcat` works there, unlike the LP3): place from LP3 → cancel while
+ringing → check whether the emulator receives the per-device terminates;
+same in the reverse direction. Regression matrix: answer + decline both
+directions, ringer + haptics both sides (emulator has no com.lightos — relay
+no-ops there, LP3 is the source of truth for relay/haptics).
+
 ## 2. Incoming call only rings after the tool is launched
 
 With the process dead, an incoming offer is missed (no bot running) until the
