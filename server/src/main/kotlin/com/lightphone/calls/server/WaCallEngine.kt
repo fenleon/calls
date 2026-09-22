@@ -100,6 +100,7 @@ object WaCallEngine : WaListener {
                     created.start(app.filesDir.resolve("wa-session").absolutePath)
                     synchronized(this) { bridge = created }
                     _error.value = null
+                    healIdentities(created)
                 } catch (e: Exception) {
                     // A failed start means no bot is running; the sync service
                     // keeps the process alive so a relaunch can retry. Failure
@@ -108,6 +109,26 @@ object WaCallEngine : WaListener {
                     Log.w(TAG, "wa bridge start failed: ${e.javaClass.simpleName}")
                 }
             }.start()
+        }
+    }
+
+    /** One-shot identity heal after the bridge starts: peers first stored
+     *  under a raw LID (the history-sync blob's mapping table can be empty)
+     *  are rewritten onto their resolved phone JID, collapsing the duplicate
+     *  rows the two ingest paths produced. */
+    private fun healIdentities(bridge: WaBridge) {
+        scope.launch {
+            val lids = (callLog?.all() ?: emptyList()).map { it.peer }
+                .plus((contacts?.all() ?: emptyList()).map { it.id })
+                .filter { it.endsWith("@lid") }
+                .distinct()
+            if (lids.isEmpty()) return@launch
+            val mapping = runCatching { bridge.resolveLids(lids) }
+                .getOrDefault(emptyList())
+                .associate { it.lid to it.pn }
+            if (mapping.isEmpty()) return@launch
+            callLog?.remap(mapping)
+            contacts?.remap(mapping)
         }
     }
 
@@ -157,6 +178,7 @@ object WaCallEngine : WaListener {
         // Fake call (dev design aid): no bridge to accept — the CallStarted
         // lands directly on the event flow and the screens run for real.
         if (fakeCall) {
+            Ringer.stop()
             _events.value = WaEvent.CallStarted(callId = "fake")
             return
         }
@@ -214,8 +236,10 @@ object WaCallEngine : WaListener {
         if (fakeCall) {
             dropCurrentCall()
             fakeCall = false
+            Ringer.stop()
             return
         }
+        Ringer.stop()
         scope.launch { runCatching { bridgeOrThrow().rejectCall() } }
     }
 
@@ -230,7 +254,11 @@ object WaCallEngine : WaListener {
             _events.value = WaEvent.CallEnded(reason = "ended")
             return
         }
-        scope.launch { runCatching { bridgeOrThrow().terminate() } }
+        scope.launch {
+            runCatching { bridgeOrThrow().terminate() }
+                .onFailure { Log.w(TAG, "terminate failed: ${it.message}") }
+                .onSuccess { Log.i(TAG, "terminate ok") }
+        }
     }
 
     fun setSpeaker(speaker: Boolean) {
@@ -255,13 +283,22 @@ object WaCallEngine : WaListener {
                     // the offer's CallEnded (not-started) so a following
                     // MissedCall logs the real number, not the raw LID.
                     pendingIncomingPeer = event.peer
+                    // The phone's ringer (default ringtone on the ring stream;
+                    // vibrate-only in vibrate mode, silent in silent mode).
+                    appContext?.let { Ringer.start(it) }
                 }
             }
             is WaEvent.CallStarted -> {
+                // Ghost guard: a CallStarted for a call the engine already
+                // dropped (timeout-terminated) must not start audio or route
+                // UI as a nameless "call" — the bridge can win an
+                // accept-vs-terminate race.
+                if (currentCallPeer == null) return
                 // Set synchronously (not inside the launch): the CallEnded
                 // branch below reads it, and the two launches must not race.
                 currentCallStarted = true
                 pendingIncomingPeer = null
+                Ringer.stop()
                 scope.launch {
                     // The answer tap (or, for an outgoing call, the still-open
                     // active-call screen) keeps the app foreground-visible, so
@@ -295,6 +332,7 @@ object WaCallEngine : WaListener {
                 val started = currentCallStarted
                 currentCallStarted = false
                 activeScreenRouted = false
+                Ringer.stop()
                 scope.launch {
                     // Exactly-once per call (bridge-side dedup) — this is the
                     // single place the audio plane and the log are torn down.
@@ -329,6 +367,7 @@ object WaCallEngine : WaListener {
                     pendingIncomingPeer = null
                     currentCallPeer = null
                     activeScreenRouted = false
+                    Ringer.stop()
                 }
             }
             is WaEvent.Paired -> {

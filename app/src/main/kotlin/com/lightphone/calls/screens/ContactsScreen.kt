@@ -68,8 +68,9 @@ class ContactsViewModel : LightViewModel<Unit>() {
     }
 }
 
-/** People reachable through the linked account. Tapping opens the dial pad
- *  prefilled (the Call button there owns the mic permission). */
+/** People reachable through the linked account. Tapping opens the contact
+ *  panel (name/number + call button); the Call button there opens the dial
+ *  pad prefilled (the Call button there owns the mic permission). */
 class ContactsScreen(sealedActivity: SealedLightActivity) :
     LightScreen<Unit, ContactsViewModel>(sealedActivity) {
 
@@ -118,7 +119,7 @@ class ContactsScreen(sealedActivity: SealedLightActivity) :
                                     .lightClickable(
                                         onClick = {
                                             navigateTo(screenFactory = { activity ->
-                                                DialScreen(activity, contact.id)
+                                                ContactInfoScreen(activity, contact)
                                             })
                                         },
                                     )

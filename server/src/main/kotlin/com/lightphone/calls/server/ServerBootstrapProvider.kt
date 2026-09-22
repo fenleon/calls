@@ -36,6 +36,11 @@ class ServerBootstrapProvider : ContentProvider() {
         with(LightSdkServer) {
             defaultClientFilterLevel = ClientFilterLevel.AllowLightSignedApks
             checkCert = { callingPackage -> checkLightSdkCert(context, callingPackage) }
+            // Platform relay (PLATFORM-RELAY.md): self-serving app, so forward
+            // what we don't consume ourselves — Calls uses no hardware keys,
+            // and haptics preferences come from the real device.
+            provideSdkSettings = { RelaySdkServerSettings(it) }
+            onDeviceKeyEvent = { _, event -> PlatformRelay.sendDeviceKeyEvent(event) }
             // Runtime permission flow: the call screens request RECORD_AUDIO
             // through the SDK flow; this APK hosts the AOSP dialog activity
             // (the WifiPermissionActivity pattern) and narrows the grantable
@@ -45,6 +50,7 @@ class ServerBootstrapProvider : ContentProvider() {
                 permissionName == android.Manifest.permission.RECORD_AUDIO
             }
         }
+        PlatformRelay.bind(context)
         return true
     }
 

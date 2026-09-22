@@ -121,21 +121,19 @@ class IncomingCallScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth(),
-                    // Native call-screen geometry (call-incoming.xml): the
-                    // status line's top lands at 384 px — pinned from the top
-                    // rather than centered so the peer sits where the native
-                    // puts it (peer top 547).
-                    contentAlignment = Alignment.TopCenter,
+                    // Feedback 2026-09-22: the peer sits ~vertical center with
+                    // "incoming..." above it (was pinned to the native 384px
+                    // top offset).
+                    contentAlignment = Alignment.Center,
                 ) {
                     Column(
-                        modifier = Modifier.padding(top = 12.2f.gridUnitsAsDp()),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         LightText(
                             text = "incoming...",
                             variant = LightTextVariant.Copy,
                         )
-                        Spacer(modifier = Modifier.padding(top = 2.73f.gridUnitsAsDp()))
+                        Spacer(modifier = Modifier.padding(top = 1.5f.gridUnitsAsDp()))
                         LightText(
                             text = formatPeer(peer),
                             variant = if (formatPeer(peer).length <= PEER_FIT_CHARS) {

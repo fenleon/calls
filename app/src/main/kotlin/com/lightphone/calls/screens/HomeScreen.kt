@@ -229,38 +229,49 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
 }
 
 /** One call-log row in the native Phone per-contact grammar (see
- *  reference/lp3/screens/phone/ + the live per-contact capture): date line
- *  above, a gap, the handset glyph with the peer's name/number
- *  bottom-aligned to it (direction shown by alignment — outgoing right,
- *  incoming/missed left; the missed glyph marks unanswered calls), and the
- *  connected duration ("0m 12s", "0s") under the glyph line. */
+ *  reference/lp3/screens/phone/recents-logged.png): date line above, a gap,
+ *  the handset glyph with the peer's name/number bottom-aligned to it —
+ *  outgoing rows right-aligned with the glyph AFTER the number (native
+ *  recents), incoming/missed left with the glyph first — and the connected
+ *  duration ("0m 12s", "0s") under the glyph line. Native glyph ≈60px
+ *  (1.5gu; the 2gu bar-button size reads oversized in the log). */
 @Composable
 private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
+    val outgoing = entry.outgoing && !entry.missed
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onClick)
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
-        horizontalAlignment = if (entry.outgoing && !entry.missed) {
-            Alignment.End
-        } else {
-            Alignment.Start
-        },
+        horizontalAlignment = if (outgoing) Alignment.End else Alignment.Start,
     ) {
         LightText(text = formatAt(entry.at), variant = LightTextVariant.Superfine)
         Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+        // Bottom-aligned row: the CALL vector draws its glyph high inside the
+        // box, so a 0.25gu down-shift puts the glyph's visual bottom on the
+        // digits' baseline (feedback 2026-09-22: tops aligned, bottoms wanted).
         Row(verticalAlignment = Alignment.Bottom) {
-            LightIcon(
-                icon = if (entry.missed) LightIcons.CALL_MISSED else LightIcons.CALL,
-                // The handset glyph ends ~10px above its box bottom (vector
-                // padding) while digits end at the descent line — nudge the
-                // icon down so the glyph's bottom sits on the text's bottom.
-                modifier = Modifier.offset(y = 0.3f.gridUnitsAsDp()),
-                contentDescription = if (entry.missed) "Missed call" else null,
-            )
-            Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
+            if (!outgoing) {
+                LightIcon(
+                    icon = if (entry.missed) LightIcons.CALL_MISSED else LightIcons.CALL,
+                    size = 1.5f,
+                    modifier = Modifier.offset(y = -0.35f.gridUnitsAsDp()),
+                    contentDescription = if (entry.missed) "Missed call" else null,
+                )
+                Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
+            }
             LightText(text = formatPeer(entry.peer), variant = LightTextVariant.Copy)
+            if (outgoing) {
+                Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
+                LightIcon(
+                    icon = LightIcons.CALL,
+                    size = 1.5f,
+                    modifier = Modifier.offset(y = -0.35f.gridUnitsAsDp()),
+                    contentDescription = "Outgoing call",
+                )
+            }
         }
+        Spacer(modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()))
         LightText(text = formatDuration(entry.duration), variant = LightTextVariant.Superfine)
     }
 }

@@ -62,6 +62,14 @@ pub struct WaContact {
     pub name: String,
 }
 
+/// One resolved identity: the raw LID a peer was first stored under and the
+/// phone-number JID the session's persisted mapping table resolved it to.
+#[derive(uniffi::Record)]
+pub struct WaLidMapping {
+    pub lid: String,
+    pub pn: String,
+}
+
 #[derive(Debug, uniffi::Error)]
 pub enum WaError {
     NotPaired,
@@ -80,6 +88,48 @@ impl std::fmt::Display for WaError {
         }
     }
 }
+
+/// Forwards the lib's `log` records to logcat (tag = record target): the
+/// terminate investigation needs the stanza-level trace on-device. Call
+/// signaling nodes carry JIDs — diagnostics builds only.
+#[cfg(target_os = "android")]
+fn install_android_logger() {
+    use std::ffi::CString;
+    struct Logcat;
+    impl log::Log for Logcat {
+        fn enabled(&self, meta: &log::Metadata) -> bool {
+            meta.level() <= log::Level::Info
+        }
+        fn log(&self, record: &log::Record) {
+            let prio = match record.level() {
+                log::Level::Error => android_log_sys::LogPriority::ERROR,
+                log::Level::Warn => android_log_sys::LogPriority::WARN,
+                log::Level::Info => android_log_sys::LogPriority::INFO,
+                _ => android_log_sys::LogPriority::DEBUG,
+            };
+            if let (Ok(tag), Ok(msg)) = (
+                CString::new(record.target()),
+                CString::new(format!("{}", record.args()).replace('\0', " ")),
+            ) {
+                unsafe {
+                    android_log_sys::__android_log_write(
+                        prio as android_log_sys::c_int,
+                        tag.as_ptr(),
+                        msg.as_ptr(),
+                    );
+                }
+            }
+        }
+        fn flush(&self) {}
+    }
+    let _ = log::set_boxed_logger(Box::new(Logcat));
+    log::set_max_level(log::LevelFilter::Info);
+    log::info!("wa-bridge: android logger installed");
+}
+
+/// Host (tests, desktop): no logcat — leave the app's logger in control.
+#[cfg(not(target_os = "android"))]
+fn install_android_logger() {}
 
 /// Logs panics to logcat (ERROR, tag `wa-bridge`). Uniffi surfaces a panicking
 /// exported fn as an abort after the unwind trips a second panic
@@ -332,6 +382,7 @@ impl WaBridge {
     #[uniffi::constructor]
     pub fn new(listener: Box<dyn WaListener>) -> Self {
         install_panic_hook();
+        install_android_logger();
         let (tx, rx) = mpsc::channel::<WaEvent>();
         std::thread::spawn(move || {
             while let Ok(event) = rx.recv() {
@@ -610,6 +661,39 @@ impl WaBridge {
                             }
                             return;
                         }
+                        // A conversation started on any other device adds its
+                        // peer on the first message — the history sync that
+                        // seeds the contact list only runs at pairing, so
+                        // this is the only path that grows the list live.
+                        // 1:1 chats only; own outgoing messages add the
+                        // recipient with an empty name (a later pushname
+                        // fills it — merge never lets "" clobber a name).
+                        if let Event::Messages(batch) = &*event {
+                            for msg in batch {
+                                let src = &msg.info.source;
+                                if src.is_group {
+                                    continue;
+                                }
+                                let (raw, name) = if src.is_from_me {
+                                    let recipient = match &src.recipient {
+                                        Some(r) => r.clone(),
+                                        None => continue,
+                                    };
+                                    (recipient, String::new())
+                                } else {
+                                    (src.chat.clone(), msg.info.push_name.trim().to_string())
+                                };
+                                let jid = raw.to_string();
+                                if jid.ends_with("@broadcast") || jid.starts_with("status@") {
+                                    continue;
+                                }
+                                let id = resolve_jid(&client, jid).await;
+                                let _ = tx.send(WaEvent::ContactsImport {
+                                    contacts: vec![WaContact { id, name }],
+                                });
+                            }
+                            return;
+                        }
                         // Call-log + contacts backfill rides in on the pairing
                         // history sync. Parsed once (inflate + decode is
                         // heavy); nothing else in the blob is used.
@@ -712,6 +796,31 @@ impl WaBridge {
 
     pub fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Resolves stored raw-LID JIDs against the session's persisted LID→phone
+    /// mapping table (usync answers are learned there). Returns only the pairs
+    /// that resolved — the engine rewrites its stores onto the phone JID, the
+    /// identity that is stable across ingest paths (history-sync blob, live
+    /// events), collapsing the duplicates the two paths produced.
+    pub async fn resolve_lids(&self, lids: Vec<String>) -> Result<Vec<WaLidMapping>, WaError> {
+        let client = self.client()?;
+        let mut out = Vec::new();
+        for lid in lids {
+            let Ok(jid) = lid.parse::<Jid>() else {
+                continue;
+            };
+            if !jid.is_lid() {
+                continue;
+            }
+            if let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await {
+                out.push(WaLidMapping {
+                    lid: jid.to_string(),
+                    pn: format!("{}@s.whatsapp.net", entry.phone_number),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Places a 1:1 call. `phone_or_jid` is a bare phone number (an E.164
@@ -1239,7 +1348,7 @@ fn import_history(
     let mut contacts: Vec<WaContact> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |id: String, name: String, seen: &mut std::collections::HashSet<String>| {
-        if !id.contains('@') || id.ends_with("@g.us") || id.starts_with("status@") || id.ends_with("@broadcast") {
+        if !id.contains('@') || id.starts_with("0@") || id.ends_with("@g.us") || id.starts_with("status@") || id.ends_with("@broadcast") {
             return;
         }
         if seen.insert(id.clone()) {

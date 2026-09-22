@@ -28,4 +28,20 @@ class ContactStore(dir: File) {
     fun all(): List<ContactEntry> =
         runCatching { json.decodeFromString(ListSerializer(ContactEntry.serializer()), file.readText()) }
             .getOrDefault(emptyList())
+
+    /** Identity heal: rewrites LID ids to their resolved phone JID (merge
+     *  collapses the duplicate) and drops junk rows ("0@s.whatsapp.net",
+     *  the account-level JID history sync sometimes carries). */
+    @Synchronized
+    fun remap(mapping: Map<String, String>) {
+        val current = all()
+        if (mapping.isEmpty() && current.none { it.id.startsWith("0@") }) return
+        val healed = current
+            .filter { !it.id.startsWith("0@") }
+            .map { it.copy(id = mapping[it.id] ?: it.id) }
+            .associateByTo(LinkedHashMap()) { it.id }
+            .values
+            .sortedBy { it.id }
+        file.writeText(json.encodeToString(ListSerializer(ContactEntry.serializer()), healed))
+    }
 }

@@ -41,6 +41,20 @@ class CallLogStore(dir: File) {
         file.writeText(json.encodeToString(ListSerializer(CallLogEntry.serializer()), list))
     }
 
+    /** Identity heal: rewrites peers whose raw LID resolved to a phone JID.
+     *  The same call delivered under both forms (raw-LID import, then a
+     *  resolved live re-emission) collapses onto the phone-number row. */
+    @Synchronized
+    fun remap(mapping: Map<String, String>) {
+        if (mapping.isEmpty()) return
+        val list = all()
+            .map { entry -> entry.copy(peer = mapping[entry.peer] ?: entry.peer) }
+            .distinctBy { Triple(it.peer, it.at, it.outgoing) }
+            .sortedBy { it.at }
+            .takeLast(200)
+        file.writeText(json.encodeToString(ListSerializer(CallLogEntry.serializer()), list))
+    }
+
     @Synchronized
     fun all(): List<CallLogEntry> =
         runCatching { json.decodeFromString(ListSerializer(CallLogEntry.serializer()), file.readText()) }

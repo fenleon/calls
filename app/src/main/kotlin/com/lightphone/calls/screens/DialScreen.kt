@@ -123,6 +123,11 @@ class DialScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .statusBarsPadding()
+                                // Native dialer: the number row starts ~41px
+                                // below the status inset (number center ≈114px)
+                                // — a ~1.6gu buffer above the row; ours sat
+                                // flush under the inset.
+                                .padding(top = 1.6f.gridUnitsAsDp())
                                 .height(3f.gridUnitsAsDp()),
                         ) {
                             LightText(
@@ -134,7 +139,10 @@ class DialScreen(
                             Box(
                                 modifier = Modifier
                                     .align(Alignment.CenterEnd)
-                                    .padding(end = 1f.gridUnitsAsDp())
+                                    // Native dialer: the delete box sits 85px
+                                    // (~2.1gu) off the edge — that margin is the
+                                    // buffer between the number and the glyph.
+                                    .padding(end = 2.1f.gridUnitsAsDp())
                                     .lightClickable(
                                         onClick = viewModel::deleteDigit,
                                         onLongClick = viewModel::clearNumber,
@@ -176,12 +184,9 @@ class DialScreen(
                 }
                 LightBottomBar(
                     items = listOf(
-                        null,
-                        LightBarButton.LightIcon(
-                            icon = LightIcons.CLOSE,
-                            onClick = { goBack() },
-                            contentDescription = "Dismiss dialpad",
-                        ),
+                        // Native grammar: call glyph bottom-LEFT, × center
+                        // (dialer-typed capture; right slot is compose there —
+                        // unused here).
                         if (number.isEmpty()) {
                             null
                         } else {
@@ -200,6 +205,12 @@ class DialScreen(
                                 contentDescription = "Call",
                             )
                         },
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CLOSE,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss dialpad",
+                        ),
+                        null,
                     ),
                 )
             }

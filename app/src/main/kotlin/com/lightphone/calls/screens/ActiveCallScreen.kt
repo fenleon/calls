@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
+import android.util.Log
 import androidx.lifecycle.viewModelScope
 import com.lightphone.calls.server.WaCallEngine
 import com.lightphone.calls.server.bridge.WaEvent
@@ -40,12 +41,17 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import com.thelightphone.sdk.ui.rememberLightHapticClick
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 class ActiveCallViewModel : LightViewModel<Unit>() {
+    companion object {
+        private const val TAG = "ActiveCall"
+    }
+
     /** True once `CallStarted` arrived — false shows "connecting…" (F1). An
      *  accepted incoming call replays its `CallStarted` through the engine's
      *  StateFlow and connects immediately. */
@@ -62,23 +68,31 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
 
     /** Outgoing placement, run by the call panel the dial tap opened (the
      *  native shows the panel immediately, not after the offer lands). The
-     *  bridge's `placeCall` never returns for an unreachable peer — the
-     *  ring wait is raced against a 10 s timeout, then the panel flashes
-     *  "call failed" and returns to the dialer. */
+     *  wait spans the full native no-answer window: `Ringing` fires when the
+     *  offer send is acknowledged — the bridge bounds that send itself
+     *  (~10s), so the panel's old 10s budget raced it and declared live
+     *  calls "failed" while they were still connecting; `CallEnded` arrives
+     *  on decline / no-answer / peer-cancel. Only a send still hung past the
+     *  60s budget flashes "call failed" — and it is terminated, never
+     *  orphaned (the orphan kept ringing the peer and could still connect:
+     *  "connected but nothing on the phone", LP3 2026-09-22). */
     fun place(peer: String) {
         viewModelScope.launch {
             try {
-                val routed = withTimeoutOrNull(10_000) {
+                val routed = withTimeoutOrNull(60_000) {
                     WaCallEngine.placeCall(peer)
                     WaCallEngine.events.first {
-                        it is WaEvent.Ringing || it is WaEvent.CallStarted
+                        it is WaEvent.Ringing || it is WaEvent.CallStarted || it is WaEvent.CallEnded
                     }
                 }
-                if (routed == null) {
+                if (routed is WaEvent.CallEnded || routed == null) {
+                    if (routed == null) WaCallEngine.endCall()
                     WaCallEngine.dropCurrentCall()
+                    Log.w(TAG, "place failed: routed=$routed")
                     error.value = "call failed"
                 }
             } catch (e: Exception) {
+                Log.w(TAG, "place failed with exception", e)
                 WaCallEngine.dropCurrentCall()
                 error.value = "call failed"
             }
@@ -133,6 +147,12 @@ class ActiveCallScreen(
         // {title:'call ended', lightenTitle:true} DisplayArea overlay):
         // flashes before the log returns, for hang-up and peer-ended alike.
         var ended by remember { mutableStateOf(false) }
+        val haptic = rememberLightHapticClick()
+
+        // A buzz marks the two call-state transitions (feedback 2026-09-22):
+        // the peer answering and the call ending.
+        LaunchedEffect(connected) { if (connected) haptic() }
+        LaunchedEffect(ended) { if (ended) haptic() }
 
         LaunchedEffect(Unit) {
             if (placeOutgoing) viewModel.place(peer)
@@ -163,14 +183,11 @@ class ActiveCallScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth(),
-                    // Native call-screen geometry (call-connected.xml): the
-                    // status line's top lands at 384 px — pinned from the top
-                    // rather than centered so the peer and toggles sit where
-                    // the native puts them (peer 547, toggles 735).
-                    contentAlignment = Alignment.TopCenter,
+                    // Feedback 2026-09-22: content vertically centered (was
+                    // pinned to the native 384px top offset).
+                    contentAlignment = Alignment.Center,
                 ) {
                     Column(
-                        modifier = Modifier.padding(top = 12.2f.gridUnitsAsDp()),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         LightText(

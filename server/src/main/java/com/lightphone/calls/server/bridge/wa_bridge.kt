@@ -772,6 +772,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -802,6 +804,8 @@ fun uniffi_wa_bridge_checksum_method_wabridge_recv_playout_pcm(
 fun uniffi_wa_bridge_checksum_method_wabridge_reject_call(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_reset_session(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_resolve_lids(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_restart_pairing(
 ): Short
@@ -889,6 +893,8 @@ fun uniffi_wa_bridge_fn_method_wabridge_reject_call(`ptr`: Pointer,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_reset_session(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_resolve_lids(`ptr`: Pointer,`lids`: RustBuffer.ByValue,
+): Long
 fun uniffi_wa_bridge_fn_method_wabridge_restart_pairing(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_send_mic_pcm(`ptr`: Pointer,`samples`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1053,6 +1059,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_reset_session() != 22808.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_resolve_lids() != 5921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_restart_pairing() != 15675.toShort()) {
@@ -1599,6 +1608,15 @@ public interface WaBridgeInterface {
     fun `resetSession`()
     
     /**
+     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
+     * mapping table (usync answers are learned there). Returns only the pairs
+     * that resolved — the engine rewrites its stores onto the phone JID, the
+     * identity that is stable across ingest paths (history-sync blob, live
+     * events), collapsing the duplicates the two paths produced.
+     */
+    suspend fun `resolveLids`(`lids`: List<kotlin.String>): List<WaLidMapping>
+    
+    /**
      * WA Web's UNPAIRED_IDLE model: the pairing QR refs expire after
      * ~60 s + 5×20 s and whatsapp-rust then disconnects a QR-only flow,
      * leaving the "click to reload" to the surface. Aborts the current bot
@@ -1891,6 +1909,34 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
 
     
     /**
+     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
+     * mapping table (usync answers are learned there). Returns only the pairs
+     * that resolved — the engine rewrites its stores onto the phone JID, the
+     * identity that is stable across ingest paths (history-sync blob, live
+     * events), collapsing the duplicates the two paths produced.
+     */
+    @Throws(WaException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `resolveLids`(`lids`: List<kotlin.String>) : List<WaLidMapping> {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_resolve_lids(
+                thisPtr,
+                FfiConverterSequenceString.lower(`lids`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterSequenceTypeWaLidMapping.lift(it) },
+        // Error FFI converter
+        WaException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * WA Web's UNPAIRED_IDLE model: the pairing QR refs expire after
      * ~60 s + 5×20 s and whatsapp-rust then disconnects a QR-only flow,
      * leaving the "click to reload" to the surface. Aborts the current bot
@@ -2135,6 +2181,42 @@ public object FfiConverterTypeWaContact: FfiConverterRustBuffer<WaContact> {
     override fun write(value: WaContact, buf: ByteBuffer) {
             FfiConverterString.write(value.`id`, buf)
             FfiConverterString.write(value.`name`, buf)
+    }
+}
+
+
+
+/**
+ * One resolved identity: the raw LID a peer was first stored under and the
+ * phone-number JID the session's persisted mapping table resolved it to.
+ */
+data class WaLidMapping (
+    var `lid`: kotlin.String, 
+    var `pn`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWaLidMapping: FfiConverterRustBuffer<WaLidMapping> {
+    override fun read(buf: ByteBuffer): WaLidMapping {
+        return WaLidMapping(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WaLidMapping) = (
+            FfiConverterString.allocationSize(value.`lid`) +
+            FfiConverterString.allocationSize(value.`pn`)
+    )
+
+    override fun write(value: WaLidMapping, buf: ByteBuffer) {
+            FfiConverterString.write(value.`lid`, buf)
+            FfiConverterString.write(value.`pn`, buf)
     }
 }
 
@@ -2655,6 +2737,34 @@ public object FfiConverterSequenceShort: FfiConverterRustBuffer<List<kotlin.Shor
 /**
  * @suppress
  */
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeWaCallRecord: FfiConverterRustBuffer<List<WaCallRecord>> {
     override fun read(buf: ByteBuffer): List<WaCallRecord> {
         val len = buf.getInt()
@@ -2701,6 +2811,34 @@ public object FfiConverterSequenceTypeWaContact: FfiConverterRustBuffer<List<WaC
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeWaContact.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeWaLidMapping: FfiConverterRustBuffer<List<WaLidMapping>> {
+    override fun read(buf: ByteBuffer): List<WaLidMapping> {
+        val len = buf.getInt()
+        return List<WaLidMapping>(len) {
+            FfiConverterTypeWaLidMapping.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WaLidMapping>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWaLidMapping.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WaLidMapping>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWaLidMapping.write(it, buf)
         }
     }
 }
