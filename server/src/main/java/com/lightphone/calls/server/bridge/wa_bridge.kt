@@ -778,6 +778,18 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -797,9 +809,13 @@ internal interface IntegrityCheckingUniffiLib : Library {
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_accept_call(
 ): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_accept_video(
+): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_account(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_account_name(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_announce_video_enabled(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_logout(
 ): Short
@@ -808,6 +824,8 @@ fun uniffi_wa_bridge_checksum_method_wabridge_own_jids(
 fun uniffi_wa_bridge_checksum_method_wabridge_place_call(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_recv_playout_pcm(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_recv_video_frame(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_reject_call(
 ): Short
@@ -819,9 +837,15 @@ fun uniffi_wa_bridge_checksum_method_wabridge_restart_pairing(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_send_mic_pcm(
 ): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_send_video_au(
+): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_set_muted(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_start(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_start_video(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_stop_video(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_terminate(
 ): Short
@@ -887,19 +911,25 @@ fun uniffi_wa_bridge_fn_free_wabridge(`ptr`: Pointer,uniffi_out_err: UniffiRustC
 ): Unit
 fun uniffi_wa_bridge_fn_constructor_wabridge_new(`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
-fun uniffi_wa_bridge_fn_method_wabridge_accept_call(`ptr`: Pointer,
+fun uniffi_wa_bridge_fn_method_wabridge_accept_call(`ptr`: Pointer,`withVideo`: Byte,
+): Long
+fun uniffi_wa_bridge_fn_method_wabridge_accept_video(`ptr`: Pointer,`token`: RustBuffer.ByValue,`fps`: Int,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_account(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_account_name(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_wa_bridge_fn_method_wabridge_announce_video_enabled(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_logout(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_own_jids(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-fun uniffi_wa_bridge_fn_method_wabridge_place_call(`ptr`: Pointer,`phoneOrJid`: RustBuffer.ByValue,
+fun uniffi_wa_bridge_fn_method_wabridge_place_call(`ptr`: Pointer,`phoneOrJid`: RustBuffer.ByValue,`withVideo`: Byte,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_recv_playout_pcm(`ptr`: Pointer,`timeoutMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_wa_bridge_fn_method_wabridge_recv_video_frame(`ptr`: Pointer,`timeoutMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_reject_call(`ptr`: Pointer,
 ): Long
@@ -911,10 +941,16 @@ fun uniffi_wa_bridge_fn_method_wabridge_restart_pairing(`ptr`: Pointer,uniffi_ou
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_send_mic_pcm(`ptr`: Pointer,`samples`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_send_video_au(`ptr`: Pointer,`au`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_wa_bridge_fn_method_wabridge_set_muted(`ptr`: Pointer,`muted`: Byte,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_start(`ptr`: Pointer,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_start_video(`ptr`: Pointer,`fps`: Int,
+): Long
+fun uniffi_wa_bridge_fn_method_wabridge_stop_video(`ptr`: Pointer,
+): Long
 fun uniffi_wa_bridge_fn_method_wabridge_terminate(`ptr`: Pointer,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_version(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1052,7 +1088,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wa_bridge_checksum_func_version() != 41176.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wa_bridge_checksum_method_wabridge_accept_call() != 40295.toShort()) {
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_accept_call() != 28832.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_accept_video() != 48064.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_account() != 46385.toShort()) {
@@ -1061,16 +1100,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_account_name() != 22574.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_announce_video_enabled() != 31678.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_logout() != 42824.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_own_jids() != 47759.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wa_bridge_checksum_method_wabridge_place_call() != 38868.toShort()) {
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_place_call() != 42867.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_recv_playout_pcm() != 35060.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_recv_video_frame() != 5945.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_reject_call() != 13409.toShort()) {
@@ -1088,10 +1133,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_send_mic_pcm() != 40540.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_send_video_au() != 37076.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_set_muted() != 56408.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_start() != 14634.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_start_video() != 15003.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_stop_video() != 9184.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_terminate() != 57755.toShort()) {
@@ -1323,6 +1377,29 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterShort: FfiConverter<Short, Short> {
     override fun lift(value: Short): Short {
         return value
@@ -1363,6 +1440,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
     }
 }
 
@@ -1469,6 +1569,25 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     }
 }
 
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+    override fun allocationSize(value: ByteArray): ULong {
+        return 4UL + value.size.toULong()
+    }
+    override fun write(value: ByteArray, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        buf.put(value)
+    }
+}
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -1572,8 +1691,22 @@ public interface WaBridgeInterface {
     
     /**
      * Answers the most recent incoming call with the bridge's audio channels.
+     * `with_video` attaches the video endpoints too, but only if the stored
+     * offer actually advertised video — an audio-only offer answered with
+     * video makes the library fail the accept (`CallError::VideoNotOffered`),
+     * so the gate here turns that into a silent audio-only accept.
      */
-    suspend fun `acceptCall`()
+    suspend fun `acceptCall`(`withVideo`: kotlin.Boolean)
+    
+    /**
+     * Accepts the peer's video-upgrade request (a `VideoStateChanged` event
+     * whose `state` is an upgrade request): `token` is the echo the event
+     * carried, resolved against the bridge's stash of the engine's real
+     * token (the library's token is opaque across the FFI boundary — see
+     * [`WaVideoUpgradeToken`]). An unknown/stale echo (request superseded or
+     * cancelled) errors without touching the call.
+     */
+    suspend fun `acceptVideo`(`token`: WaVideoUpgradeToken, `fps`: kotlin.UInt)
     
     /**
      * Own account JID once known — fresh pairing via `PairSuccess`, restored
@@ -1586,6 +1719,14 @@ public interface WaBridgeInterface {
      * line. Empty before pairing (the caller falls back to the pn).
      */
     fun `accountName`(): kotlin.String?
+    
+    /**
+     * Sends the standalone `<video state=1>` (Enabled) the protocol wants
+     * after a mid-call video upgrade completes. Synchronous like `logout`:
+     * the stanza send is awaited via `block_on` on the caller's (non-tokio)
+     * thread — uniffi polls this fn there.
+     */
+    fun `announceVideoEnabled`()
     
     /**
      * User-initiated unpair: deregister the device with the server
@@ -1619,7 +1760,7 @@ public interface WaBridgeInterface {
      * this reports `CallStarted` directly (the ring mark is raised as
      * `Pending` before the send so that window can never drop an answer).
      */
-    suspend fun `placeCall`(`phoneOrJid`: kotlin.String): kotlin.String
+    suspend fun `placeCall`(`phoneOrJid`: kotlin.String, `withVideo`: kotlin.Boolean): kotlin.String
     
     /**
      * Pulls one playout frame (960 samples = 60 ms at 16 kHz) from the Kotlin
@@ -1627,6 +1768,13 @@ public interface WaBridgeInterface {
      * engine starved us within `timeout_ms` — play silence for that frame.
      */
     fun `recvPlayoutPcm`(`timeoutMs`: kotlin.UInt): List<kotlin.Short>
+    
+    /**
+     * Pulls one received peer video AU from the Kotlin decode thread,
+     * polling with a 5 ms sleep. `None` means the engine sent nothing within
+     * `timeout_ms` — render the previous frame / wait.
+     */
+    fun `recvVideoFrame`(`timeoutMs`: kotlin.UInt): WaVideoFrame?
     
     /**
      * Declines the most recent incoming call. Fire-and-forget: the library
@@ -1664,6 +1812,17 @@ public interface WaBridgeInterface {
     fun `sendMicPcm`(`samples`: List<kotlin.Short>)
     
     /**
+     * Pushes one encoded H.264 access unit (Annex-B, start codes included)
+     * from the Kotlin encoder thread. The channel is bounded(4); when full
+     * the OLDEST AU is dropped so capture never blocks, and the `Ok(dropped)`
+     * return tells Kotlin to request a sync frame from the encoder (the peer
+     * lost reference data). Like `send_mic_pcm`, the channel never closes:
+     * without a live call the AU is buffered (drop-oldest) and flushed by
+     * the next `attach_call`.
+     */
+    fun `sendVideoAu`(`au`: kotlin.ByteArray): kotlin.Boolean
+    
+    /**
      * Mutes or unmutes the local microphone. The engine keeps the stream fed
      * with DTX comfort noise, so the peer never renegotiates the transport.
      * (`CallHandle::set_muted` is a pure atomic store and the body holds no
@@ -1679,6 +1838,21 @@ public interface WaBridgeInterface {
      * surface as events (`NeedPairing` → `PairingQr` → `Paired`).
      */
     fun `start`(`dataDir`: kotlin.String)
+    
+    /**
+     * Starts OUR video direction on the active call (audio→video upgrade we
+     * initiate, or media for a `.video()` call started without endpoints).
+     * `fps` sets the source's RTP timestamp stride (`90_000 / fps`); it must
+     * match the pacing of the AUs Kotlin pushes via `send_video_au`.
+     */
+    suspend fun `startVideo`(`fps`: kotlin.UInt)
+    
+    /**
+     * Stops OUR video direction (sends `<video state=6>`, tears the local
+     * media plane down). Idempotent per the library, so a duplicate stop is
+     * a no-op, never an error for the call UI.
+     */
+    suspend fun `stopVideo`()
     
     /**
      * Hangs up the active call: signals the peer with `<terminate>` and tears
@@ -1784,15 +1958,49 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     
     /**
      * Answers the most recent incoming call with the bridge's audio channels.
+     * `with_video` attaches the video endpoints too, but only if the stored
+     * offer actually advertised video — an audio-only offer answered with
+     * video makes the library fail the accept (`CallError::VideoNotOffered`),
+     * so the gate here turns that into a silent audio-only accept.
      */
     @Throws(WaException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `acceptCall`() {
+    override suspend fun `acceptCall`(`withVideo`: kotlin.Boolean) {
         return uniffiRustCallAsync(
         callWithPointer { thisPtr ->
             UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_accept_call(
                 thisPtr,
-                
+                FfiConverterBoolean.lower(`withVideo`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        WaException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Accepts the peer's video-upgrade request (a `VideoStateChanged` event
+     * whose `state` is an upgrade request): `token` is the echo the event
+     * carried, resolved against the bridge's stash of the engine's real
+     * token (the library's token is opaque across the FFI boundary — see
+     * [`WaVideoUpgradeToken`]). An unknown/stale echo (request superseded or
+     * cancelled) errors without touching the call.
+     */
+    @Throws(WaException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `acceptVideo`(`token`: WaVideoUpgradeToken, `fps`: kotlin.UInt) {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_accept_video(
+                thisPtr,
+                FfiConverterTypeWaVideoUpgradeToken.lower(`token`),FfiConverterUInt.lower(`fps`),
             )
         },
         { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_void(future, callback, continuation) },
@@ -1836,6 +2044,24 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Sends the standalone `<video state=1>` (Enabled) the protocol wants
+     * after a mid-call video upgrade completes. Synchronous like `logout`:
+     * the stanza send is awaited via `block_on` on the caller's (non-tokio)
+     * thread — uniffi polls this fn there.
+     */
+    @Throws(WaException::class)override fun `announceVideoEnabled`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_announce_video_enabled(
+        it, _status)
+}
+    }
+    
     
 
     
@@ -1893,12 +2119,12 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
      */
     @Throws(WaException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `placeCall`(`phoneOrJid`: kotlin.String) : kotlin.String {
+    override suspend fun `placeCall`(`phoneOrJid`: kotlin.String, `withVideo`: kotlin.Boolean) : kotlin.String {
         return uniffiRustCallAsync(
         callWithPointer { thisPtr ->
             UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_place_call(
                 thisPtr,
-                FfiConverterString.lower(`phoneOrJid`),
+                FfiConverterString.lower(`phoneOrJid`),FfiConverterBoolean.lower(`withVideo`),
             )
         },
         { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_rust_buffer(future, callback, continuation) },
@@ -1921,6 +2147,23 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_recv_playout_pcm(
+        it, FfiConverterUInt.lower(`timeoutMs`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Pulls one received peer video AU from the Kotlin decode thread,
+     * polling with a 5 ms sleep. `None` means the engine sent nothing within
+     * `timeout_ms` — render the previous frame / wait.
+     */override fun `recvVideoFrame`(`timeoutMs`: kotlin.UInt): WaVideoFrame? {
+            return FfiConverterOptionalTypeWaVideoFrame.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_recv_video_frame(
         it, FfiConverterUInt.lower(`timeoutMs`),_status)
 }
     }
@@ -2034,6 +2277,28 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
 
     
     /**
+     * Pushes one encoded H.264 access unit (Annex-B, start codes included)
+     * from the Kotlin encoder thread. The channel is bounded(4); when full
+     * the OLDEST AU is dropped so capture never blocks, and the `Ok(dropped)`
+     * return tells Kotlin to request a sync frame from the encoder (the peer
+     * lost reference data). Like `send_mic_pcm`, the channel never closes:
+     * without a live call the AU is buffered (drop-oldest) and flushed by
+     * the next `attach_call`.
+     */
+    @Throws(WaException::class)override fun `sendVideoAu`(`au`: kotlin.ByteArray): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_send_video_au(
+        it, FfiConverterByteArray.lower(`au`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Mutes or unmutes the local microphone. The engine keeps the stream fed
      * with DTX comfort noise, so the peer never renegotiates the transport.
      * (`CallHandle::set_muted` is a pure atomic store and the body holds no
@@ -2078,6 +2343,61 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     }
     
     
+
+    
+    /**
+     * Starts OUR video direction on the active call (audio→video upgrade we
+     * initiate, or media for a `.video()` call started without endpoints).
+     * `fps` sets the source's RTP timestamp stride (`90_000 / fps`); it must
+     * match the pacing of the AUs Kotlin pushes via `send_video_au`.
+     */
+    @Throws(WaException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `startVideo`(`fps`: kotlin.UInt) {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_start_video(
+                thisPtr,
+                FfiConverterUInt.lower(`fps`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        WaException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Stops OUR video direction (sends `<video state=6>`, tears the local
+     * media plane down). Idempotent per the library, so a duplicate stop is
+     * a no-op, never an error for the call UI.
+     */
+    @Throws(WaException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `stopVideo`() {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_stop_video(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        WaException.ErrorHandler,
+    )
+    }
 
     
     /**
@@ -2287,6 +2607,93 @@ public object FfiConverterTypeWaLidMapping: FfiConverterRustBuffer<WaLidMapping>
 
 
 
+/**
+ * One received peer video access unit (Annex-B, start codes included).
+ */
+data class WaVideoFrame (
+    var `data`: kotlin.ByteArray, 
+    /**
+     * The AU carries an IDR/SPS/PPS NAL — safe point to (re)start a decoder.
+     */
+    var `keyframe`: kotlin.Boolean, 
+    /**
+     * Peer device orientation in 90° steps (0..3).
+     */
+    var `orientation`: kotlin.UByte
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWaVideoFrame: FfiConverterRustBuffer<WaVideoFrame> {
+    override fun read(buf: ByteBuffer): WaVideoFrame {
+        return WaVideoFrame(
+            FfiConverterByteArray.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUByte.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WaVideoFrame) = (
+            FfiConverterByteArray.allocationSize(value.`data`) +
+            FfiConverterBoolean.allocationSize(value.`keyframe`) +
+            FfiConverterUByte.allocationSize(value.`orientation`)
+    )
+
+    override fun write(value: WaVideoFrame, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`data`, buf)
+            FfiConverterBoolean.write(value.`keyframe`, buf)
+            FfiConverterUByte.write(value.`orientation`, buf)
+    }
+}
+
+
+
+/**
+ * Echo of the engine's video-upgrade token. The library's `VideoUpgradeToken`
+ * keeps `epoch` private (no getter/constructor at the fork's HEAD), so the
+ * bridge cannot decompose/recompose it across the FFI boundary: the engine's
+ * real token lives in the bridge's stash (set by `VideoStateChanged`, consumed
+ * by `accept_video`, matched by `generation`), and this record's fields are the
+ * opaque Kotlin-side echo — pass it back verbatim; `epoch` carries no
+ * independent meaning (0). One upgrade request is live at a time, so the
+ * generation match fully identifies the request.
+ */
+data class WaVideoUpgradeToken (
+    var `generation`: kotlin.ULong, 
+    var `epoch`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWaVideoUpgradeToken: FfiConverterRustBuffer<WaVideoUpgradeToken> {
+    override fun read(buf: ByteBuffer): WaVideoUpgradeToken {
+        return WaVideoUpgradeToken(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WaVideoUpgradeToken) = (
+            FfiConverterULong.allocationSize(value.`generation`) +
+            FfiConverterULong.allocationSize(value.`epoch`)
+    )
+
+    override fun write(value: WaVideoUpgradeToken, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`generation`, buf)
+            FfiConverterULong.write(value.`epoch`, buf)
+    }
+}
+
+
+
 
 
 sealed class WaException: kotlin.Exception() {
@@ -2491,6 +2898,30 @@ sealed class WaEvent {
         companion object
     }
     
+    /**
+     * The peer's `<video state=N>` signaling landed (V0): upgrade request /
+     * accept / stop, as the raw wire code (see the library's `VideoState`).
+     * `upgrade` carries the echo of the engine's upgrade token — Kotlin
+     * passes it verbatim to `acceptVideo`; the bridge resolves it against
+     * its own stash (see [`WaVideoUpgradeToken`]).
+     */
+    data class VideoStateChanged(
+        val `state`: kotlin.Int, 
+        val `orientation`: kotlin.UByte?, 
+        val `upgrade`: WaVideoUpgradeToken?) : WaEvent() {
+        companion object
+    }
+    
+    /**
+     * Relay-send backpressure shed complete outbound video AUs before
+     * transmission (`CallEvent::OutboundMediaDropped`). `packets` is not
+     * surfaced: the bridge's frame cadence is what Kotlin can react to.
+     */
+    data class OutboundVideoDropped(
+        val `accessUnits`: kotlin.UInt) : WaEvent() {
+        companion object
+    }
+    
 
     
     companion object
@@ -2534,6 +2965,14 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 FfiConverterSequenceTypeWaContact.read(buf),
                 FfiConverterBoolean.read(buf),
                 FfiConverterBoolean.read(buf),
+                )
+            13 -> WaEvent.VideoStateChanged(
+                FfiConverterInt.read(buf),
+                FfiConverterOptionalUByte.read(buf),
+                FfiConverterOptionalTypeWaVideoUpgradeToken.read(buf),
+                )
+            14 -> WaEvent.OutboundVideoDropped(
+                FfiConverterUInt.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2624,6 +3063,22 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 + FfiConverterBoolean.allocationSize(value.`renameOnly`)
             )
         }
+        is WaEvent.VideoStateChanged -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterInt.allocationSize(value.`state`)
+                + FfiConverterOptionalUByte.allocationSize(value.`orientation`)
+                + FfiConverterOptionalTypeWaVideoUpgradeToken.allocationSize(value.`upgrade`)
+            )
+        }
+        is WaEvent.OutboundVideoDropped -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterUInt.allocationSize(value.`accessUnits`)
+            )
+        }
     }
 
     override fun write(value: WaEvent, buf: ByteBuffer) {
@@ -2686,6 +3141,18 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 FfiConverterSequenceTypeWaContact.write(value.`contacts`, buf)
                 FfiConverterBoolean.write(value.`replace`, buf)
                 FfiConverterBoolean.write(value.`renameOnly`, buf)
+                Unit
+            }
+            is WaEvent.VideoStateChanged -> {
+                buf.putInt(13)
+                FfiConverterInt.write(value.`state`, buf)
+                FfiConverterOptionalUByte.write(value.`orientation`, buf)
+                FfiConverterOptionalTypeWaVideoUpgradeToken.write(value.`upgrade`, buf)
+                Unit
+            }
+            is WaEvent.OutboundVideoDropped -> {
+                buf.putInt(14)
+                FfiConverterUInt.write(value.`accessUnits`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2753,6 +3220,38 @@ public object FfiConverterTypeWaListener: FfiConverterCallbackInterface<WaListen
 /**
  * @suppress
  */
+public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
+    override fun read(buf: ByteBuffer): kotlin.UByte? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUByte.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UByte?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUByte.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UByte?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUByte.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
@@ -2775,6 +3274,70 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeWaVideoFrame: FfiConverterRustBuffer<WaVideoFrame?> {
+    override fun read(buf: ByteBuffer): WaVideoFrame? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeWaVideoFrame.read(buf)
+    }
+
+    override fun allocationSize(value: WaVideoFrame?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeWaVideoFrame.allocationSize(value)
+        }
+    }
+
+    override fun write(value: WaVideoFrame?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeWaVideoFrame.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeWaVideoUpgradeToken: FfiConverterRustBuffer<WaVideoUpgradeToken?> {
+    override fun read(buf: ByteBuffer): WaVideoUpgradeToken? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeWaVideoUpgradeToken.read(buf)
+    }
+
+    override fun allocationSize(value: WaVideoUpgradeToken?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeWaVideoUpgradeToken.allocationSize(value)
+        }
+    }
+
+    override fun write(value: WaVideoUpgradeToken?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeWaVideoUpgradeToken.write(value, buf)
         }
     }
 }

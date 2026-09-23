@@ -190,9 +190,11 @@ object WaCallEngine : WaListener {
     // the caller renders it, nothing is logged (peer data / reasons).
 
     /** Places a 1:1 call to a bare phone number (E.164 `+` ok) or full JID.
+     *  `withVideo` offers H.264 from the start (V0 bridge surface; the
+     *  encode/render UI is a later task — callers pass false for now).
      *  The attempt is logged instantly (the user sees the call in the log
      *  while it still connects) — `CallEnded` never logs. */
-    suspend fun placeCall(phoneOrJid: String) {
+    suspend fun placeCall(phoneOrJid: String, withVideo: Boolean = false) {
         Log.i(TAG, "placeCall: callLog=${callLog != null} peerLen=${phoneOrJid.length}")
         currentCallPeer = phoneOrJid
         currentCallOutgoing = true
@@ -206,7 +208,7 @@ object WaCallEngine : WaListener {
             ),
         )
         try {
-            bridgeOrThrow().placeCall(phoneOrJid)
+            bridgeOrThrow().placeCall(phoneOrJid, withVideo)
         } catch (e: Exception) {
             // No call came up — drop the peer so the next `CallEnded` (or a
             // glare-suppressed offer) isn't logged against this attempt.
@@ -216,7 +218,7 @@ object WaCallEngine : WaListener {
         }
     }
 
-    suspend fun acceptCall() {
+    suspend fun acceptCall(withVideo: Boolean = false) {
         // Fake call (dev design aid): no bridge to accept — the CallStarted
         // lands directly on the event flow and the screens run for real.
         if (fakeCall) {
@@ -224,7 +226,7 @@ object WaCallEngine : WaListener {
             _events.value = WaEvent.CallStarted(callId = "fake")
             return
         }
-        bridgeOrThrow().acceptCall()
+        bridgeOrThrow().acceptCall(withVideo)
     }
 
     suspend fun rejectCall() = bridgeOrThrow().rejectCall()
@@ -491,6 +493,14 @@ object WaCallEngine : WaListener {
                     event.renameOnly -> contacts?.rename(list)
                     else -> contacts?.merge(list)
                 }
+            }
+            // V0 passthroughs: raw video signaling, surfaced to UI observers
+            // via `_events` below — the video UI reduction is a later task.
+            is WaEvent.VideoStateChanged -> {
+                Log.i(TAG, "video state: ${event.state}")
+            }
+            is WaEvent.OutboundVideoDropped -> {
+                Log.i(TAG, "outbound video dropped: ${event.accessUnits}")
             }
             else -> Unit
         }

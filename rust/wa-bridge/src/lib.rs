@@ -6,7 +6,9 @@ use whatsapp_rust::prelude::wa;
 use whatsapp_rust::prelude::{Bot, BotHandle, Client, SqliteStore};
 use whatsapp_rust::types::call::{CallAction, ElsewhereOutcome, IncomingCall};
 use whatsapp_rust::types::events::Event;
-use whatsapp_rust::voip::CallHandle;
+use whatsapp_rust::voip::{
+    CallEvent, CallHandle, VideoFrame, VideoSink, VideoSource, VideoUpgradeToken,
+};
 use whatsapp_rust::{async_channel as chan, Jid};
 
 /// Event surface toward Kotlin. Task 3 + Task 5 surface; `Ringing` is the
@@ -65,6 +67,22 @@ pub enum WaEvent {
         replace: bool,
         rename_only: bool,
     },
+    /// The peer's `<video state=N>` signaling landed (V0): upgrade request /
+    /// accept / stop, as the raw wire code (see the library's `VideoState`).
+    /// `upgrade` carries the echo of the engine's upgrade token — Kotlin
+    /// passes it verbatim to `acceptVideo`; the bridge resolves it against
+    /// its own stash (see [`WaVideoUpgradeToken`]).
+    VideoStateChanged {
+        state: i32,
+        orientation: Option<u8>,
+        upgrade: Option<WaVideoUpgradeToken>,
+    },
+    /// Relay-send backpressure shed complete outbound video AUs before
+    /// transmission (`CallEvent::OutboundMediaDropped`). `packets` is not
+    /// surfaced: the bridge's frame cadence is what Kotlin can react to.
+    OutboundVideoDropped {
+        access_units: u32,
+    },
 }
 
 /// One imported call-log record; maps 1:1 onto the engine's `CallLogEntry`.
@@ -86,6 +104,30 @@ pub struct WaCallRecord {
 pub struct WaContact {
     pub id: String,
     pub name: String,
+}
+
+/// One received peer video access unit (Annex-B, start codes included).
+#[derive(uniffi::Record)]
+pub struct WaVideoFrame {
+    pub data: Vec<u8>,
+    /// The AU carries an IDR/SPS/PPS NAL — safe point to (re)start a decoder.
+    pub keyframe: bool,
+    /// Peer device orientation in 90° steps (0..3).
+    pub orientation: u8,
+}
+
+/// Echo of the engine's video-upgrade token. The library's `VideoUpgradeToken`
+/// keeps `epoch` private (no getter/constructor at the fork's HEAD), so the
+/// bridge cannot decompose/recompose it across the FFI boundary: the engine's
+/// real token lives in the bridge's stash (set by `VideoStateChanged`, consumed
+/// by `accept_video`, matched by `generation`), and this record's fields are the
+/// opaque Kotlin-side echo — pass it back verbatim; `epoch` carries no
+/// independent meaning (0). One upgrade request is live at a time, so the
+/// generation match fully identifies the request.
+#[derive(uniffi::Record)]
+pub struct WaVideoUpgradeToken {
+    pub generation: u64,
+    pub epoch: u64,
 }
 
 /// One resolved identity: the raw LID a peer was first stored under and the
@@ -259,6 +301,25 @@ pub struct WaBridge {
     /// `recv_playout_pcm`). The engine's jitter buffer paces it.
     playout_tx: chan::Sender<Vec<i16>>,
     playout_rx: chan::Receiver<Vec<i16>>,
+    /// Outgoing encoded-video push channel (Kotlin camera/encoder → engine),
+    /// bounded so a stalled engine can never block the Kotlin capture thread
+    /// — `send_video_au` drops the OLDEST access unit instead of waiting.
+    video_tx: chan::Sender<Vec<u8>>,
+    /// Receiver side of the video-AU channel: a clone rides along on every
+    /// call as the engine's `VideoSource`; the bridge's own copy drains the
+    /// stale AU in the drop-oldest path and flushes leftover AUs when a new
+    /// call attaches.
+    video_rx: chan::Receiver<Vec<u8>>,
+    /// Incoming-video pull channel (engine pushes reassembled peer AUs,
+    /// Kotlin pulls via `recv_video_frame`). The engine drops a frame if the
+    /// sink can't keep up; bounded(8) absorbs a decode hiccup.
+    vframe_tx: chan::Sender<VideoFrame>,
+    vframe_rx: chan::Receiver<VideoFrame>,
+    /// The newest peer video-upgrade token from `CallEvent::VideoStateChanged`
+    /// (the engine's `epoch` is private, so the real token is stashed here and
+    /// `accept_video` resolves Kotlin's echo against it — see
+    /// [`WaVideoUpgradeToken`]).
+    pending_upgrade: PendingUpgrade,
     /// The live call, if any: stored by `place_call`/`accept_call`, taken by
     /// `terminate`, cleared by the `wait_ended` watcher, cloned for
     /// `set_muted`. Shared so the watcher task can reach it.
@@ -332,6 +393,10 @@ impl WaBridge {
                 .clone(),
             mic_rx: self.mic_rx.clone(),
             playout_tx: self.playout_tx.clone(),
+            video_rx: self.video_rx.clone(),
+            vframe_tx: self.vframe_tx.clone(),
+            vframe_rx: self.vframe_rx.clone(),
+            pending_upgrade: self.pending_upgrade.clone(),
             call: self.call.clone(),
             ended_emitted: self.ended_emitted.clone(),
             incoming: self.incoming.clone(),
@@ -351,6 +416,10 @@ struct CallCtx {
     runtime: tokio::runtime::Handle,
     mic_rx: chan::Receiver<Vec<i16>>,
     playout_tx: chan::Sender<Vec<i16>>,
+    video_rx: chan::Receiver<Vec<u8>>,
+    vframe_tx: chan::Sender<VideoFrame>,
+    vframe_rx: chan::Receiver<VideoFrame>,
+    pending_upgrade: PendingUpgrade,
     call: Arc<Mutex<Option<CallHandle>>>,
     ended_emitted: EndedEmitted,
     incoming: Arc<Mutex<Option<IncomingCall>>>,
@@ -385,13 +454,21 @@ impl CallCtx {
         let call_id = handle.call_id().to_string();
         // Stale frames from a previous call may still sit in the bounded(4)
         // mic channel (≈240 ms of audio) — flush them so this call never
-        // drains them (the engine's receiver clone shares the buffer).
+        // drains them (the engine's receiver clone shares the buffer). Same
+        // for the video channels: leftover outbound AUs (the engine's source
+        // clone shares the buffer) and peer frames (Kotlin must not decode a
+        // previous call's bytes into this call).
         while self.mic_rx.try_recv().is_ok() {}
+        while self.video_rx.try_recv().is_ok() {}
+        while self.vframe_rx.try_recv().is_ok() {}
+        // A pending upgrade belongs to the previous call's negotiation.
+        *self.pending_upgrade.lock().unwrap() = None;
         *self.call.lock().unwrap() = Some(handle.clone());
         let events = self.events.clone();
         let call_slot = self.call.clone();
         let ended = self.ended_emitted.clone();
         let watcher_call_id = call_id.clone();
+        let relay_handle = handle.clone();
         self.runtime.spawn(async move {
             handle.wait_ended().await;
             // The call is dead: mute/terminate must stop referring to it.
@@ -409,6 +486,45 @@ impl CallCtx {
                 let _ = events.send(WaEvent::CallEnded {
                     reason: "ended".to_string(),
                 });
+            }
+        });
+        // Video/media diagnostics relay: `CallHandle::events()` is a single
+        // competitive queue the bridge never consumed before — this loop is
+        // its sole consumer, and it ends when the call tears down (the
+        // registry drops the senders and the channel closes).
+        let relay_events = self.events.clone();
+        let relay_upgrade = self.pending_upgrade.clone();
+        self.runtime.spawn(async move {
+            let call_events = relay_handle.events();
+            while let Ok(event) = call_events.recv().await {
+                match event {
+                    CallEvent::VideoStateChanged {
+                        state,
+                        orientation,
+                        upgrade_token,
+                    } => {
+                        // Stash the real token for `accept_video`; a tokenless
+                        // transition means the negotiation moved on (resolved,
+                        // cancelled, enabled/stopped) — no request is pending.
+                        *relay_upgrade.lock().unwrap() = upgrade_token;
+                        let _ = relay_events.send(WaEvent::VideoStateChanged {
+                            state: state.code(),
+                            orientation,
+                            upgrade: upgrade_token.map(|t| WaVideoUpgradeToken {
+                                generation: t.generation(),
+                                epoch: 0,
+                            }),
+                        });
+                    }
+                    CallEvent::OutboundMediaDropped {
+                        video_access_units, ..
+                    } => {
+                        let _ = relay_events.send(WaEvent::OutboundVideoDropped {
+                            access_units: video_access_units,
+                        });
+                    }
+                    _ => {}
+                }
             }
         });
         call_id
@@ -429,6 +545,8 @@ impl WaBridge {
         });
         let (mic_tx, mic_rx) = chan::bounded(4);
         let (playout_tx, playout_rx) = chan::bounded(8);
+        let (video_tx, video_rx) = chan::bounded(4);
+        let (vframe_tx, vframe_rx) = chan::bounded(8);
         Self {
             events: tx,
             runtime: OnceLock::new(),
@@ -441,6 +559,11 @@ impl WaBridge {
             mic_rx,
             playout_tx,
             playout_rx,
+            video_tx,
+            video_rx,
+            vframe_tx,
+            vframe_rx,
+            pending_upgrade: Arc::new(Mutex::new(None)),
             call: Arc::new(Mutex::new(None)),
             ended_emitted: Arc::new(Mutex::new(None)),
             incoming: Arc::new(Mutex::new(None)),
@@ -941,7 +1064,11 @@ impl WaBridge {
     /// unless the accept lands during the offer send itself, in which case
     /// this reports `CallStarted` directly (the ring mark is raised as
     /// `Pending` before the send so that window can never drop an answer).
-    pub async fn place_call(&self, phone_or_jid: String) -> Result<String, WaError> {
+    pub async fn place_call(
+        &self,
+        phone_or_jid: String,
+        with_video: bool,
+    ) -> Result<String, WaError> {
         let client = self.client()?;
         let ctx = self.call_ctx();
         join(ctx.runtime.clone().spawn(async move {
@@ -954,13 +1081,33 @@ impl WaBridge {
             }
             let jid = Self::parse_jid(&phone_or_jid)?;
             let (mic, playout) = ctx.audio_endpoints();
+            // Video-from-start: the offer then advertises H.264 and the media
+            // plane is wired before the peer answers. An outgoing offer
+            // always carries what we ask for, so no VideoNotOffered here.
+            // (`voip` is bound first: the builder borrows it, so it cannot
+            // live in a temporary.)
+            let voip = client.voip();
+            let builder = voip.call(&jid).audio(mic, playout);
+            let builder = if with_video {
+                builder.video(
+                    BridgeVideoSource {
+                        rx: ctx.video_rx.clone(),
+                        fps: DEFAULT_VIDEO_FPS,
+                    },
+                    BridgeVideoSink {
+                        tx: ctx.vframe_tx.clone(),
+                    },
+                )
+            } else {
+                builder
+            };
             // Ring mark BEFORE the offer send: the call id is generated
             // inside `start()`, so the mark goes up as `Pending` and an
             // accept landing in the send window is claimed (stashed) rather
             // than dropped — `settle_outgoing_ring` reports whichever state
             // the call is actually in once `start()` returns.
             *ctx.outgoing_ringing.lock().unwrap() = Some(OutgoingRing::Pending);
-            let handle = match client.voip().call(&jid).audio(mic, playout).start().await {
+            let handle = match builder.start().await {
                 Ok(handle) => handle,
                 Err(e) => {
                     // No call came up: a stale mark must never answer.
@@ -990,7 +1137,11 @@ impl WaBridge {
     }
 
     /// Answers the most recent incoming call with the bridge's audio channels.
-    pub async fn accept_call(&self) -> Result<(), WaError> {
+    /// `with_video` attaches the video endpoints too, but only if the stored
+    /// offer actually advertised video — an audio-only offer answered with
+    /// video makes the library fail the accept (`CallError::VideoNotOffered`),
+    /// so the gate here turns that into a silent audio-only accept.
+    pub async fn accept_call(&self, with_video: bool) -> Result<(), WaError> {
         let client = self.client()?;
         let ctx = self.call_ctx();
         join(ctx.runtime.clone().spawn(async move {
@@ -1000,11 +1151,31 @@ impl WaBridge {
                 .unwrap()
                 .take()
                 .ok_or(WaError::NoActiveCall)?;
+            let offer_is_video = matches!(
+                &incoming.action,
+                CallAction::Offer {
+                    is_video: true,
+                    group_jid: None,
+                    ..
+                }
+            );
             let (mic, playout) = ctx.audio_endpoints();
-            let handle = client
-                .voip()
-                .accept(&incoming)
-                .audio(mic, playout)
+            let voip = client.voip();
+            let builder = voip.accept(&incoming).audio(mic, playout);
+            let builder = if with_video && offer_is_video {
+                builder.video(
+                    BridgeVideoSource {
+                        rx: ctx.video_rx.clone(),
+                        fps: DEFAULT_VIDEO_FPS,
+                    },
+                    BridgeVideoSink {
+                        tx: ctx.vframe_tx.clone(),
+                    },
+                )
+            } else {
+                builder
+            };
+            let handle = builder
                 .start()
                 .await
                 .map_err(|e| WaError::Protocol { msg: e.to_string() })?;
@@ -1120,11 +1291,214 @@ impl WaBridge {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+
+    /// Pushes one encoded H.264 access unit (Annex-B, start codes included)
+    /// from the Kotlin encoder thread. The channel is bounded(4); when full
+    /// the OLDEST AU is dropped so capture never blocks, and the `Ok(dropped)`
+    /// return tells Kotlin to request a sync frame from the encoder (the peer
+    /// lost reference data). Like `send_mic_pcm`, the channel never closes:
+    /// without a live call the AU is buffered (drop-oldest) and flushed by
+    /// the next `attach_call`.
+    pub fn send_video_au(&self, mut au: Vec<u8>) -> Result<bool, WaError> {
+        match self.video_tx.try_send(au) {
+            Ok(()) => return Ok(false),
+            Err(chan::TrySendError::Full(returned)) => au = returned,
+            Err(chan::TrySendError::Closed(_)) => return Err(WaError::NoActiveCall),
+        }
+        // Full: remove the oldest AU ourselves (the engine's recv simply
+        // waits for the next one), which frees a slot for this one.
+        match self.video_rx.try_recv() {
+            Ok(_) => {}
+            // Drained between our try_send and now — a slot is already free.
+            Err(chan::TryRecvError::Empty) => {}
+            // The engine is gone (no call, or it just ended).
+            Err(chan::TryRecvError::Closed) => return Err(WaError::NoActiveCall),
+        }
+        self.video_tx
+            .send_blocking(au)
+            .map(|_| true)
+            .map_err(|_| WaError::NoActiveCall)
+    }
+
+    /// Pulls one received peer video AU from the Kotlin decode thread,
+    /// polling with a 5 ms sleep. `None` means the engine sent nothing within
+    /// `timeout_ms` — render the previous frame / wait.
+    pub fn recv_video_frame(&self, timeout_ms: u32) -> Option<WaVideoFrame> {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            match self.vframe_rx.try_recv() {
+                Ok(frame) => {
+                    return Some(WaVideoFrame {
+                        data: frame.data,
+                        keyframe: frame.keyframe,
+                        orientation: frame.orientation,
+                    })
+                }
+                Err(chan::TryRecvError::Empty) => {}
+                Err(chan::TryRecvError::Closed) => return None,
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Starts OUR video direction on the active call (audio→video upgrade we
+    /// initiate, or media for a `.video()` call started without endpoints).
+    /// `fps` sets the source's RTP timestamp stride (`90_000 / fps`); it must
+    /// match the pacing of the AUs Kotlin pushes via `send_video_au`.
+    pub async fn start_video(&self, fps: u32) -> Result<(), WaError> {
+        let handle = self
+            .call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::NoActiveCall)?;
+        let ctx = self.call_ctx();
+        join(ctx.runtime.clone().spawn(async move {
+            handle
+                .start_video(
+                    BridgeVideoSource {
+                        rx: ctx.video_rx.clone(),
+                        fps,
+                    },
+                    BridgeVideoSink {
+                        tx: ctx.vframe_tx.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| WaError::Protocol { msg: e.to_string() })
+        }))
+        .await
+    }
+
+    /// Accepts the peer's video-upgrade request (a `VideoStateChanged` event
+    /// whose `state` is an upgrade request): `token` is the echo the event
+    /// carried, resolved against the bridge's stash of the engine's real
+    /// token (the library's token is opaque across the FFI boundary — see
+    /// [`WaVideoUpgradeToken`]). An unknown/stale echo (request superseded or
+    /// cancelled) errors without touching the call.
+    pub async fn accept_video(&self, token: WaVideoUpgradeToken, fps: u32) -> Result<(), WaError> {
+        let handle = self
+            .call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::NoActiveCall)?;
+        let ctx = self.call_ctx();
+        join(ctx.runtime.clone().spawn(async move {
+            let stashed =
+                take_upgrade(&ctx.pending_upgrade, token.generation).ok_or(WaError::Protocol {
+                    msg: "unknown video upgrade token".to_string(),
+                })?;
+            handle
+                .accept_video(
+                    stashed,
+                    BridgeVideoSource {
+                        rx: ctx.video_rx.clone(),
+                        fps,
+                    },
+                    BridgeVideoSink {
+                        tx: ctx.vframe_tx.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| WaError::Protocol { msg: e.to_string() })
+        }))
+        .await
+    }
+
+    /// Stops OUR video direction (sends `<video state=6>`, tears the local
+    /// media plane down). Idempotent per the library, so a duplicate stop is
+    /// a no-op, never an error for the call UI.
+    pub async fn stop_video(&self) -> Result<(), WaError> {
+        let handle = self
+            .call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::NoActiveCall)?;
+        let ctx = self.call_ctx();
+        join(ctx.runtime.clone().spawn(async move {
+            handle
+                .stop_video()
+                .await
+                .map_err(|e| WaError::Protocol { msg: e.to_string() })
+        }))
+        .await
+    }
+
+    /// Sends the standalone `<video state=1>` (Enabled) the protocol wants
+    /// after a mid-call video upgrade completes. Synchronous like `logout`:
+    /// the stanza send is awaited via `block_on` on the caller's (non-tokio)
+    /// thread — uniffi polls this fn there.
+    pub fn announce_video_enabled(&self) -> Result<(), WaError> {
+        let handle = self
+            .call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::NoActiveCall)?;
+        let runtime = self.runtime.get().ok_or(WaError::NotPaired)?;
+        runtime
+            .block_on(handle.announce_video_enabled())
+            .map_err(|e| WaError::Protocol { msg: e.to_string() })
+    }
 }
 
 /// Single-shot end marker: the call id whose end has already surfaced to
 /// Kotlin, shared between the `wait_ended` watcher and the bot-event pump.
 type EndedEmitted = Arc<Mutex<Option<String>>>;
+
+/// Stash of the engine's real video-upgrade token (see [`WaVideoUpgradeToken`]).
+type PendingUpgrade = Arc<Mutex<Option<VideoUpgradeToken>>>;
+
+/// Consumes the stashed upgrade token whose `generation` matches Kotlin's
+/// echo. The stash holds at most one live peer request, so the generation
+/// identifies it; a miss (stale echo, superseded or cancelled request) leaves
+/// the stash untouched and returns `None`.
+fn take_upgrade(stash: &PendingUpgrade, generation: u64) -> Option<VideoUpgradeToken> {
+    let mut guard = stash.lock().unwrap();
+    match guard.as_ref() {
+        Some(t) if t.generation() == generation => guard.take(),
+        _ => None,
+    }
+}
+
+/// Default source frame rate when Kotlin doesn't pick one (video-from-start):
+/// the library's compatibility cadence (15 fps, `VIDEO_TS_STRIDE_15FPS`).
+const DEFAULT_VIDEO_FPS: u32 = 15;
+
+/// The bridge's `VideoSource`: hands the engine the Kotlin-pushed Annex-B AUs
+/// (`send_video_au`) and reports the RTP timestamp stride for `fps`.
+struct BridgeVideoSource {
+    rx: chan::Receiver<Vec<u8>>,
+    fps: u32,
+}
+
+impl VideoSource for BridgeVideoSource {
+    fn frames(&self) -> chan::Receiver<Vec<u8>> {
+        self.rx.clone()
+    }
+
+    fn rtp_timestamp_stride(&self) -> u32 {
+        90_000 / self.fps.max(1)
+    }
+}
+
+/// The bridge's `VideoSink`: the engine writes reassembled peer AUs Kotlin
+/// pulls via `recv_video_frame`.
+struct BridgeVideoSink {
+    tx: chan::Sender<VideoFrame>,
+}
+
+impl VideoSink for BridgeVideoSink {
+    fn playout(&self) -> chan::Sender<VideoFrame> {
+        self.tx.clone()
+    }
+}
 
 /// The outgoing call's ring state (F1). The library generates the call id
 /// inside `voip().call(..).start()`, so between the glare guard and the
@@ -1752,11 +2126,120 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(40));
     }
 
+    /// V0: the video-AU channel mirrors the mic queue — bounded(4), and once
+    /// full the OLDEST AU is dropped while `send_video_au` reports the shed
+    /// (Kotlin's cue to request a sync frame from the encoder).
+    #[test]
+    fn video_channel_drops_oldest_when_full_and_reports() {
+        let bridge = WaBridge::new(Box::new(Sink(Arc::default())));
+        for first in 0..6u8 {
+            let dropped = bridge
+                .send_video_au(vec![first])
+                .expect("send never blocks");
+            assert_eq!(dropped, first >= 4, "AU {first}: shed only once full");
+        }
+        let mut got = Vec::new();
+        while let Ok(au) = bridge.video_rx.try_recv() {
+            got.push(au[0]);
+        }
+        // bounded(4): AUs 0 and 1 were dropped, the newest four survive.
+        assert_eq!(got, vec![2, 3, 4, 5]);
+    }
+
+    /// V0: what the engine receives on a call — the `BridgeVideoSource` hands
+    /// out the Kotlin-pushed AUs in order, at the requested RTP stride.
+    #[test]
+    fn video_au_roundtrips_to_the_source_receiver() {
+        let bridge = WaBridge::new(Box::new(Sink(Arc::default())));
+        for seq in 0..3u8 {
+            bridge
+                .send_video_au(vec![seq])
+                .expect("bounded(4) is empty");
+        }
+        let source = BridgeVideoSource {
+            rx: bridge.video_rx.clone(),
+            fps: 20,
+        };
+        let rx = source.frames();
+        assert_eq!(source.rtp_timestamp_stride(), 90_000 / 20);
+        for seq in 0..3u8 {
+            let au = rx.try_recv().expect("pushed AU");
+            assert_eq!(au, vec![seq]);
+        }
+        assert!(rx.try_recv().is_err(), "no phantom AUs");
+    }
+
+    /// V0: the sink channel carries the engine's reassembled peer AUs to
+    /// `recv_video_frame` (keyframe/orientation preserved), which times out
+    /// to `None` exactly like `recv_playout_pcm` times out to empty.
+    #[test]
+    fn recv_video_frame_returns_frame_then_times_out_to_none() {
+        let bridge = WaBridge::new(Box::new(Sink(Arc::default())));
+        let mut frame = VideoFrame::new(vec![0, 0, 0, 1, 0x65]); // IDR NAL → keyframe
+        frame.orientation = 2;
+        bridge
+            .vframe_tx
+            .send_blocking(frame)
+            .expect("bounded(8) is empty");
+
+        let got = bridge.recv_video_frame(40).expect("frame within timeout");
+        assert!(got.keyframe);
+        assert_eq!(got.orientation, 2);
+        assert_eq!(got.data, vec![0, 0, 0, 1, 0x65]);
+
+        let started = std::time::Instant::now();
+        assert!(bridge.recv_video_frame(40).is_none());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+    }
+
+    /// V0: the upgrade stash resolves only a matching generation. The hit
+    /// path needs a real engine-issued token (`VideoUpgradeToken` has no
+    /// external constructor — the very reason the stash exists), so the miss
+    /// paths are what a unit test can drive; the stash is left untouched so
+    /// a still-live request survives a stale echo.
+    #[test]
+    fn upgrade_stash_misses_leave_it_untouched() {
+        let stash: PendingUpgrade = Arc::default();
+        assert!(take_upgrade(&stash, 7).is_none(), "empty stash misses");
+        assert!(stash.lock().unwrap().is_none());
+    }
+
+    /// V0: every video-control entry point on a call-less bridge errors
+    /// `NoActiveCall` instead of panicking or silently succeeding.
+    #[tokio::test]
+    async fn video_control_without_a_call_is_no_active_call() {
+        let bridge = WaBridge::new(Box::new(Sink(Arc::default())));
+        assert!(matches!(
+            bridge.start_video(15).await,
+            Err(WaError::NoActiveCall)
+        ));
+        assert!(matches!(
+            bridge
+                .accept_video(
+                    WaVideoUpgradeToken {
+                        generation: 1,
+                        epoch: 0
+                    },
+                    15
+                )
+                .await,
+            Err(WaError::NoActiveCall)
+        ));
+        assert!(matches!(
+            bridge.stop_video().await,
+            Err(WaError::NoActiveCall)
+        ));
+        assert!(matches!(
+            bridge.announce_video_enabled(),
+            Err(WaError::NoActiveCall)
+        ));
+    }
+
     #[tokio::test]
     async fn place_call_unpaired_is_not_paired() {
         let bridge = WaBridge::new(Box::new(Sink(Arc::default())));
         assert!(matches!(
-            bridge.place_call("+15551234567".to_string()).await,
+            bridge.place_call("+15551234567".to_string(), false).await,
             Err(WaError::NotPaired)
         ));
     }
