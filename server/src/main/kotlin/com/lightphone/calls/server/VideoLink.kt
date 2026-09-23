@@ -29,10 +29,14 @@ import java.util.concurrent.Executor
  *  mismatch with the encoder's actual pacing fails at builder time
  *  (facade.rs:214). */
 enum class VideoTier(val width: Int, val height: Int, val fps: Int, val bitrateBps: Int) {
-    /** Default (cellular) tier. */
+    /** Default (cellular) tier — the only tier v1 ships with. */
     DEFAULT(640, 480, 15, 600_000),
 
-    /** WiFi tier. */
+    /** WiFi tier — the documented future config point (SPEC §3.3), NOT
+     *  selectable in v1: picking it needs network-based selection plus
+     *  plumbing a tier fps through `place_call`/`accept_call` (the bridge
+     *  derives its RTP stride from the fps — see the class doc). Real-call
+     *  evidence decides whether it's ever needed. */
     WIFI(1280, 720, 20, 1_800_000),
 }
 
@@ -331,7 +335,14 @@ class VideoLink(
     }
 
     private fun prependCsd(au: ByteArray): ByteArray {
-        val params = csd ?: return au
+        val params = csd
+        if (params == null) {
+            // A keyframe without held CSD ships a peer-unresolvable IDR (no
+            // SPS/PPS in the AU). Diagnostics-gated: this is an anomaly the
+            // INFO_OUTPUT_FORMAT_CHANGED handler should have prevented.
+            if (dumpFile != null) Log.w(TAG, "keyframe AU with no held CSD — IDR shipped without SPS/PPS")
+            return au
+        }
         val stripped = stripParameterSets(au)
         return params + stripped
     }

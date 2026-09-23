@@ -164,6 +164,13 @@ mechanics — see the V3 report):
 - Thermal + battery: 30-min 480p15 video soak on the LP3, audit-dir convention
   (battery-audit-*); G99 encode thermal ceiling check — drop to 360p tier if
   the SoC throttles.
+- Tier decision: v1 ships the 480p@15 tier only — the 720p@20 WiFi tier stays
+  a documented config point (SPEC §3.3) unless real-call evidence demands it.
+- Incoming video badge on IncomingCallScreen (needs a Light glyph pass) —
+  deferred from V2/V3.
+- Peer decode death shows a frozen frame — verify the UX on a real call.
+- First-picture latency on the LP3: the CODEC_CONFIG seed may drop VCL NALs
+  on HW decoders — fallback: split SPS/PPS config from the IDR data buffer.
 - B&W AMOLED rendering check (LP3 display renders video grayscale — confirm
   it's usable; the overlay must stay readable).
 - Regression: PLAN.md rig matrix (answer/decline/cancel both directions, ringer

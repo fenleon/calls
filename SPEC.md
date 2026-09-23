@@ -101,7 +101,7 @@ Bridge rules:
 
 ### 3.3 Video (M3)
 
-- **Encode:** Camera2 (front) → `MediaCodec` `video/avc`, **Constrained Baseline L3.1**, no B-frames, one slice/frame. Tiers: 480p@15 fps ~600 kbps (default/cellular), 720p@20 fps ~1.8 Mbps (WiFi). GOP 30. `VideoSource.rtp_timestamp_stride()` must equal `90_000 / fps` — declare it to match the encoder tier.
+- **Encode:** Camera2 (front) → `MediaCodec` `video/avc`, **Constrained Baseline L3.1**, no B-frames, one slice/frame. Tiers: v1 ships the **480p@15 fps ~600 kbps (default/cellular) tier only**; the specced 720p@20 fps ~1.8 Mbps WiFi tier is **not selectable** until real-call evidence demands it (selecting it needs network-based tier choice plus plumbing a tier fps through `place_call`/`accept_call` — the known seam; the bridge derives its RTP stride from the fps). GOP 30. `VideoSource.rtp_timestamp_stride()` must equal `90_000 / fps` — declare it to match the encoder tier.
 - **CSD repetition:** MediaCodec hands out SPS/PPS once as CSD; Kotlin must prepend them to **every** IDR AU before `send_video_au` (the engine packs them into one STAP-A, PR #1496, but only if the AU carries them). Deterministic test: every AU flagged keyframe contains SPS+PPS+IDR.
 - **Keyframes:** peer PLI/FIR is handled engine-internally (`VideoControl::RequireKeyframe`) — V1-Q1 in VIDEO-PLAN.md traces how/if it reaches the `VideoSource`; locally, on `send_video_au` returning dropped, request `MediaCodec PARAMETER_KEY_REQUEST_SYNC_FRAME` (bridge queue is drop-oldest).
 - **Decode:** `recv_video_au` pull thread → `video/avc` decoder → `SurfaceView` (not TextureView). Hold AUs until first keyframe; seed decoder config from its SPS/PPS. `KEY_LOW_LATENCY=1`.

@@ -733,23 +733,28 @@ object WaCallEngine : WaListener {
         scope.launch { runCatching { bridge?.stopVideo() } }
     }
 
-    /** Stops our video direction (toggle off): encoder down first, then the
-     *  bridge signaling. Idempotent per the library. */
+    /** Stops our video direction (toggle off): encoder and decoder down
+     *  first (the decoder is idempotent — a relayed local state change would
+     *  also stop it, but don't rely on the relay), then the bridge
+     *  signaling. Idempotent per the library. */
     fun stopVideo() {
         videoConsent = false
         _videoState.value = VideoUiState.Off
         scope.launch {
             runCatching { bridge?.stopVideo() }
             stopVideoEncoding()
+            stopVideoDecoding()
         }
     }
 
     /** The UI's peer-video surface. `null` detaches (the SurfaceView went
-     *  away — screen left / surface destroyed). */
+     *  away — screen left / surface destroyed): the decode link stops
+     *  synchronously so no in-flight `releaseOutputBuffer(render)` can race
+     *  the framework's surface teardown. A non-null attach stays async. */
     fun attachPeerSurface(surface: Surface?) {
         if (surface == null) {
             peerSurface = null
-            scope.launch { stopVideoDecoding() }
+            stopVideoDecoding()
             return
         }
         peerSurface = surface
@@ -780,12 +785,14 @@ object WaCallEngine : WaListener {
 
     /** Camera loss / late start failure (V1-review carry-over): surface it
      *  honestly — video state off (the UI's toggle un-underlines), an error
-     *  line, and the peer told we stopped. */
+     *  line, and the peer told we stopped. The decoder stops too (idempotent;
+     *  don't rely on the relayed local state change). */
     private fun onVideoEncodeLost(reason: String) {
         Log.w(TAG, "video encode lost: $reason")
         encodeLink = null
         _videoState.value = VideoUiState.Off
         _error.value = "camera unavailable — video stopped"
+        stopVideoDecoding()
         scope.launch { runCatching { bridge?.stopVideo() } }
     }
 
