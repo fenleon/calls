@@ -106,6 +106,8 @@ Bridge rules:
 - **Keyframes:** peer PLI/FIR is handled engine-internally (`VideoControl::RequireKeyframe`) — V1-Q1 in VIDEO-PLAN.md traces how/if it reaches the `VideoSource`; locally, on `send_video_au` returning dropped, request `MediaCodec PARAMETER_KEY_REQUEST_SYNC_FRAME` (bridge queue is drop-oldest).
 - **Decode:** `recv_video_au` pull thread → `video/avc` decoder → `SurfaceView` (not TextureView). Hold AUs until first keyframe; seed decoder config from its SPS/PPS. `KEY_LOW_LATENCY=1`.
 - **Orientation:** send sensor-native frames; `VideoFrame.orientation` from the peer is applied at render. ⚠ Verify the orientation value convention against a real call before shipping.
+- **Upgrade decline (v1 mapping):** declining the peer's upgrade prompt sends `stopVideo` — wire `VideoState 6 (Stopped)`, not the protocol's `UpgradeReject (5)`: the bridge exposes no reject, so the peer's client sees "video stopped" rather than an explicit rejection; the protocol's `UpgradeRejectByTimeout` (7/9) backstops an unanswered request. ⚠ V4: confirm the peer's client exits its upgrade-wait cleanly after our stop-mapped decline.
+- **Ledger:** exposing a real `UpgradeReject (5)` needs a bridge/library patch (a `reject_video` on `CallHandle`/facade surfaced through UniFFI) — bridge change, future task; the UI's decline maps to stop until then.
 - Final accept for video-from-start calls gates on "first decodable SPS/PPS/IDR pushed" — pre-warm the camera when the ring UI appears (camera open is ~300–800 ms).
 
 ## 4. UI (Light design system)

@@ -406,6 +406,9 @@ class VideoDecodeLink(
     private val pull: () -> WaVideoFrame?,
     private val onOrientation: (Int) -> Unit = {},
     private val onEnded: (String) -> Unit = {},
+    /** 2 s fed/rendered heartbeat — diagnostics only (battery rule: verbose
+     *  logging is a runtime opt-in; the decode path never logs in production). */
+    private val logHeartbeat: Boolean = false,
 ) {
     private var thread: Thread? = null
     @Volatile private var running = false
@@ -496,10 +499,12 @@ class VideoDecodeLink(
                 // else: hold — nothing is decodable before the first keyframe.
             }
             rendered += drain(decoder, info)
-            val now = System.nanoTime()
-            if (now - lastLog > 2_000_000_000L) {
-                Log.i(TAG, "decode: fed=$fed rendered=$rendered")
-                lastLog = now
+            if (logHeartbeat) {
+                val now = System.nanoTime()
+                if (now - lastLog > 2_000_000_000L) {
+                    Log.i(TAG, "decode: fed=$fed rendered=$rendered")
+                    lastLog = now
+                }
             }
         }
         Log.i(TAG, "decode loop exit: fed=$fed rendered=$rendered")

@@ -56,6 +56,20 @@ object WaCallEngine : WaListener {
      *  bridge's RTP timestamp stride on `startVideo`/`acceptVideo`. */
     private val videoTier = VideoTier.DEFAULT
 
+    /** The incoming offer advertised video — the answer defaults to
+     *  `acceptCall(withVideo = true)` for it, so the answer flow routes the
+     *  offer's video through without the screen needing to know. */
+    @Volatile
+    private var incomingVideoOffer = false
+
+    /** Explicit user video consent for the live call: answering a video
+     *  offer, an outgoing with-video placement, an accepted upgrade, or the
+     *  toggle. Only this — never a raw `VideoStateChanged(1)` — lets
+     *  `CallStarted` start the camera (state 1 can arrive at offer time,
+     *  before the user opted in). */
+    @Volatile
+    private var videoConsent = false
+
     /** Auto-restarts since the last successful pairing — caps the watchdog /
      *  unlink respawn loop when recovery is hopeless. */
     private var autoRestarts = 0
@@ -120,6 +134,7 @@ object WaCallEngine : WaListener {
         currentCallStarted = false
         currentCallConnectedAt = 0
         currentCallLogAt = 0
+        incomingVideoOffer = false
         activeScreenRouted = false
     }
 
@@ -240,16 +255,18 @@ object WaCallEngine : WaListener {
         )
         try {
             bridgeOrThrow().placeCall(phoneOrJid, withVideo)
+            if (withVideo) videoConsent = true
         } catch (e: Exception) {
             // No call came up — drop the peer so the next `CallEnded` (or a
             // glare-suppressed offer) isn't logged against this attempt.
+            videoConsent = false
             currentCallPeer = null
             currentCallStarted = false
             throw e
         }
     }
 
-    suspend fun acceptCall(withVideo: Boolean = false) {
+    suspend fun acceptCall(withVideo: Boolean = incomingVideoOffer) {
         // Fake call (dev design aid): no bridge to accept — the CallStarted
         // lands directly on the event flow and the screens run for real.
         if (fakeCall) {
@@ -257,7 +274,25 @@ object WaCallEngine : WaListener {
             _events.value = WaEvent.CallStarted(callId = "fake")
             return
         }
-        bridgeOrThrow().acceptCall(withVideo)
+        // Answering a video offer (the default routes the offer's `isVideo`
+        // through): record consent and pre-warm the encoder — the camera
+        // opens (~300–800 ms) while the accept signaling goes out, so the
+        // peer waits for neither. Pre-accept AUs buffer in the bridge's
+        // drop-oldest queue and flush on media attach.
+        if (withVideo) {
+            videoConsent = true
+            startVideoEncoding()
+        }
+        try {
+            bridgeOrThrow().acceptCall(withVideo)
+        } catch (e: Exception) {
+            // The accept failed — never leave a consented camera running.
+            if (withVideo) {
+                videoConsent = false
+                scope.launch { stopVideoEncoding() }
+            }
+            throw e
+        }
     }
 
     suspend fun rejectCall() = bridgeOrThrow().rejectCall()
@@ -355,6 +390,7 @@ object WaCallEngine : WaListener {
                 if (currentCallPeer == null) {
                     currentCallPeer = event.peer
                     currentCallOutgoing = false
+                    incomingVideoOffer = event.isVideo
                     // Resolved display peer of the ringing offer — survives
                     // the offer's CallEnded (not-started) so a following
                     // MissedCall logs the real number, not the raw LID.
@@ -388,11 +424,14 @@ object WaCallEngine : WaListener {
                         _error.value = "Call connected but microphone unavailable — reopen the app"
                     }
                     runCatching { audioLink().start() }
-                    // Video negotiated before the call started (a
-                    // video-from-start offer): the encoder joins the audio
-                    // plane here; the decode half starts when the UI attaches
-                    // its surface (or right below if it already has).
-                    if (_videoState.value is VideoUiState.On) {
+                    // Video consented before the call started (a video offer
+                    // the user answered with video, or an outgoing with-video
+                    // placement): the encoder joins the audio plane and the
+                    // decode half starts. A raw `VideoStateChanged(1)` alone
+                    // never starts the camera — state 1 can arrive at offer
+                    // time, before the user opted in.
+                    if (videoConsent) {
+                        _videoState.value = VideoUiState.On
                         startVideoEncoding()
                         startVideoDecoding()
                     }
@@ -435,10 +474,12 @@ object WaCallEngine : WaListener {
                     // Release the diagnostics video exercise too, if running.
                     videoLink?.let { videoLink = null; diagnostics = false; _videoExerciseRunning.value = false; it.stop() }
                     // The call's video plane: encode + decode halves, surface,
-                    // reduced state — back to a fresh video-less baseline.
+                    // consent + reduced state — back to a fresh baseline.
                     encodeLink?.let { encodeLink = null; it.stop() }
                     stopVideoDecoding()
                     peerSurface = null
+                    videoConsent = false
+                    incomingVideoOffer = false
                     _videoState.value = VideoUiState.Off
                     peerOrientation.value = 0
                     appContext?.let { WaCallService.tryStop(it) }
@@ -474,6 +515,7 @@ object WaCallEngine : WaListener {
                     )
                     pendingIncomingPeer = null
                     currentCallPeer = null
+                    incomingVideoOffer = false
                     activeScreenRouted = false
                     Ringer.stop()
                 }
@@ -627,6 +669,7 @@ object WaCallEngine : WaListener {
                 return@launch
             }
             startVideoEncoding()
+            videoConsent = true
             _videoState.value = VideoUiState.On
         }
     }
@@ -643,6 +686,7 @@ object WaCallEngine : WaListener {
             }.onFailure { Log.w(TAG, "acceptVideo failed: ${it.message}") }.isSuccess
             if (ok) {
                 startVideoEncoding()
+                videoConsent = true
                 _videoState.value = VideoUiState.On
             } else {
                 _videoState.value = VideoUiState.Off
@@ -662,6 +706,7 @@ object WaCallEngine : WaListener {
     /** Stops our video direction (toggle off): encoder down first, then the
      *  bridge signaling. Idempotent per the library. */
     fun stopVideo() {
+        videoConsent = false
         _videoState.value = VideoUiState.Off
         scope.launch {
             runCatching { bridge?.stopVideo() }
@@ -867,6 +912,7 @@ object WaCallEngine : WaListener {
                     decodeExercise = null
                     exerciseNote.value = reason
                 },
+                logHeartbeat = true,
             )
             link.start()
             decodeExercise = link

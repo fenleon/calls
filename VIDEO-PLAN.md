@@ -145,6 +145,8 @@ the answer/connect tap on both emulator and LP3 (Android 14 while-in-use rule).
 
 - Orientation convention verified vs a real call; lipsync sanity (audio path
   unchanged — watch playout trim interaction).
+- Confirm the peer's client exits its upgrade-wait cleanly after our
+  stop-mapped decline (SPEC §3.3: prompt-decline sends VideoState 6, not 5).
 - Thermal + battery: 30-min 480p15 video soak on the LP3, audit-dir convention
   (battery-audit-*); G99 encode thermal ceiling check — drop to 360p tier if
   the SoC throttles.
