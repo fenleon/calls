@@ -77,10 +77,11 @@ class SettingsViewModel : LightViewModel<Unit>() {
     fun demoCall() = WaCallEngine.debugIncomingCall()
 
     /** Diagnostics video-encoder exercise (see [WaCallEngine.toggleVideoExercise]). */
-    val videoExercise = MutableStateFlow(WaCallEngine.videoExerciseRunning)
+    val videoExercise = WaCallEngine.videoExerciseRunning
+    val exerciseNote = WaCallEngine.exerciseNote
 
     fun toggleVideoExercise() {
-        videoExercise.value = WaCallEngine.toggleVideoExercise()
+        WaCallEngine.toggleVideoExercise()
     }
 }
 
@@ -102,6 +103,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val accountName by viewModel.accountName.collectAsState()
         val engineError by viewModel.engineError.collectAsState()
         val videoExercise by viewModel.videoExercise.collectAsState()
+        val exerciseNote by viewModel.exerciseNote.collectAsState()
 
         LightTheme(colors = themeColors) {
             Column(
@@ -181,9 +183,28 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                         LightText(text = "Video encoder test", variant = LightTextVariant.Heading)
                         Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
                         LightText(
-                            text = if (videoExercise) "Recording — tap to stop" else "Diagnostics",
+                            text = when {
+                                videoExercise -> "Recording — tap to stop"
+                                else -> exerciseNote ?: "Diagnostics"
+                            },
                             variant = LightTextVariant.Detail,
                         )
+                    }
+                    Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .lightClickable(
+                                onClick = {
+                                    navigateTo(screenFactory = { activity ->
+                                        VideoDecodeTestScreen(activity)
+                                    })
+                                },
+                            ),
+                    ) {
+                        LightText(text = "Video decode test", variant = LightTextVariant.Heading)
+                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+                        LightText(text = "Diagnostics", variant = LightTextVariant.Detail)
                     }
                     engineError?.let { message ->
                         Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))

@@ -1,5 +1,8 @@
 package com.lightphone.calls.screens
 
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,7 +12,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -20,10 +25,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.viewinterop.AndroidView
 import android.util.Log
 import androidx.lifecycle.viewModelScope
+import com.lightphone.calls.R
 import com.lightphone.calls.server.WaCallEngine
+import com.lightphone.calls.server.VideoUiState
 import com.lightphone.calls.server.bridge.WaEvent
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -60,6 +70,22 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     val speaker = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
 
+    /** Distinguishes a flash that leaves the screen (failed placement) from
+     *  an in-call error line that just clears (video failure etc.). */
+    val fatal = MutableStateFlow(false)
+
+    /** The video plane's reduced state + peer orientation (engine-owned). */
+    val videoState = WaCallEngine.videoState
+    val peerOrientation = WaCallEngine.peerOrientation
+
+    init {
+        // The engine's error line mirrors here so in-call failures (mic FGS
+        // blocked, video failed) ride the same ErrorFlash.
+        viewModelScope.launch {
+            WaCallEngine.error.collect { error.value = it }
+        }
+    }
+
     /** The peer answered (outgoing) or the replayed event confirmed the
      *  accepted incoming call. */
     fun onStarted() {
@@ -90,11 +116,13 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
                     if (routed == null) WaCallEngine.endCall()
                     WaCallEngine.dropCurrentCall()
                     Log.w(TAG, "place failed: routed=$routed")
+                    fatal.value = true
                     error.value = "call failed"
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "place failed with exception", e)
                 WaCallEngine.dropCurrentCall()
+                fatal.value = true
                 error.value = "call failed"
             }
         }
@@ -116,6 +144,22 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
         speaker.value = !speaker.value
         WaCallEngine.setSpeaker(speaker.value)
     }
+
+    /** Video toggle (icon row): off → start our direction; on → stop. The
+     *  upgrade prompt is its own accept/decline row — the toggle ignores it. */
+    fun toggleVideo() {
+        when (videoState.value) {
+            is VideoUiState.On -> WaCallEngine.stopVideo()
+            is VideoUiState.Off -> WaCallEngine.startVideo()
+            is VideoUiState.UpgradeRequested -> Unit
+        }
+    }
+
+    fun acceptVideo() = WaCallEngine.acceptVideo()
+    fun declineVideo() = WaCallEngine.declineVideo()
+
+    /** The peer-video SurfaceView's lifecycle → the engine's decode half. */
+    fun attachSurface(surface: Surface?) = WaCallEngine.attachPeerSurface(surface)
 
     fun end() = WaCallEngine.endCall()
 }
@@ -143,7 +187,12 @@ class ActiveCallScreen(
         val muted by viewModel.muted.collectAsState()
         val speaker by viewModel.speaker.collectAsState()
         val error by viewModel.error.collectAsState()
+        val fatal by viewModel.fatal.collectAsState()
         val bluetoothConnected by LightBluetooth.connected.collectAsState()
+        val videoState by viewModel.videoState.collectAsState()
+        val orientation by viewModel.peerOrientation.collectAsState()
+        val videoOn = videoState is VideoUiState.On
+        val upgradeRequested = videoState is VideoUiState.UpgradeRequested
         // Native "call ended" panel (PHONE-PANELS.md §5.3: the bundle's
         // {title:'call ended', lightenTitle:true} DisplayArea overlay):
         // flashes before the log returns, for hang-up and peer-ended alike.
@@ -179,6 +228,66 @@ class ActiveCallScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // Peer video, full-bleed: the SurfaceView sits behind the
+                // window's content (it punches its hole in the hierarchy), so
+                // the monochrome overlay — status line, peer name, controls —
+                // stays drawn above it. Composed for the whole call and
+                // attached once: the framework does not reliably hand a fresh
+                // surface to a SurfaceView re-created in the same activity
+                // (observed on the emulator), so a video off→on toggle must
+                // not rebuild the view — it only flips the cover below. The
+                // decode half starts when video turns On (or CallStarted with
+                // video) and this surface is attached.
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            // Rotate per the peer's reported camera
+                            // orientation (90° steps 0..3). The exact
+                            // convention gets verified against a real call
+                            // in V4. A 90°-rotated full-bleed layer no
+                            // longer covers the screen, so odd steps scale
+                            // back up to stay full-bleed.
+                            rotationZ = orientation * 90f
+                            if (orientation % 2 == 1) {
+                                val cover = maxOf(
+                                    size.width.toFloat() / size.height,
+                                    size.height.toFloat() / size.width,
+                                )
+                                scaleX = cover
+                                scaleY = cover
+                            }
+                        },
+                    factory = { context ->
+                        SurfaceView(context).apply {
+                            holder.addCallback(object : SurfaceHolder.Callback {
+                                override fun surfaceCreated(holder: SurfaceHolder) {
+                                    viewModel.attachSurface(holder.surface)
+                                }
+
+                                override fun surfaceChanged(
+                                    holder: SurfaceHolder,
+                                    format: Int,
+                                    width: Int,
+                                    height: Int,
+                                ) = Unit
+
+                                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                    viewModel.attachSurface(null)
+                                }
+                            })
+                        }
+                    },
+                )
+                // Cover the punched-out video area while no video shows —
+                // otherwise the dead surface renders as a black rectangle.
+                if (!videoOn) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(LightThemeTokens.colors.background),
+                    )
+                }
             Column(modifier = Modifier.fillMaxSize()) {
                 Box(
                     modifier = Modifier
@@ -191,8 +300,14 @@ class ActiveCallScreen(
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
+                        // The upgrade prompt takes the status line's slot
+                        // (the confirm-panel's centered-question grammar).
                         LightText(
-                            text = if (connected) "connected" else "connecting...",
+                            text = when {
+                                upgradeRequested -> "video?"
+                                connected -> "connected"
+                                else -> "connecting..."
+                            },
                             variant = LightTextVariant.Copy,
                         )
                         Spacer(modifier = Modifier.padding(top = 2.73f.gridUnitsAsDp()))
@@ -204,6 +319,24 @@ class ActiveCallScreen(
                                 LightTextVariant.Heading
                             },
                         )
+                        if (upgradeRequested) {
+                            Spacer(modifier = Modifier.padding(top = 1.25f.gridUnitsAsDp()))
+                            // Accept/decline in the confirm-panel grammar:
+                            // × left, △ right (the incoming panel's split).
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                ConfirmIcon(
+                                    drawable = R.drawable.ic_lp3_confirm_x,
+                                    contentDescription = "Decline video",
+                                    onClick = viewModel::declineVideo,
+                                )
+                                Spacer(modifier = Modifier.padding(start = 4f.gridUnitsAsDp()))
+                                ConfirmIcon(
+                                    drawable = R.drawable.ic_lp3_confirm_triangle,
+                                    contentDescription = "Accept video",
+                                    onClick = viewModel::acceptVideo,
+                                )
+                            }
+                        }
                         Spacer(modifier = Modifier.padding(top = 1.25f.gridUnitsAsDp()))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             ToggleIcon(
@@ -234,6 +367,13 @@ class ActiveCallScreen(
                                 },
                                 onClick = { openBluetoothSettings() },
                             )
+                            Spacer(modifier = Modifier.padding(start = 3f.gridUnitsAsDp()))
+                            ToggleIcon(
+                                icon = LightIcons.CAMERA,
+                                active = videoOn,
+                                contentDescription = if (videoOn) "Stop video" else "Start video",
+                                onClick = viewModel::toggleVideo,
+                            )
                         }
                     }
                 }
@@ -261,9 +401,10 @@ class ActiveCallScreen(
                     message = if (ended) "call ended" else error,
                     onDismiss = {
                         viewModel.error.value = null
-                        // A failed call returns to the dialer; an ended one
-                        // to the log.
-                        if (ended || error != null) goBack()
+                        // A failed placement returns to the dialer; an ended
+                        // call to the log. An in-call line (video failed,
+                        // camera loss) just clears.
+                        if (ended || fatal) goBack()
                     },
                 )
             }
@@ -300,6 +441,29 @@ private fun ToggleIcon(
                         Color.Transparent
                     },
                 ),
+        )
+    }
+}
+
+/** A confirm-panel-style action icon (the upgrade prompt's decline × and
+ *  accept △, same drawables as the unlink confirm panel's bottom bar) sized
+ *  to the native in-call icon (2 grid units, §5.4). */
+@Composable
+private fun ConfirmIcon(
+    drawable: Int,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .lightClickable(onClick = onClick)
+            .padding(horizontal = 1f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+    ) {
+        Icon(
+            painter = painterResource(drawable),
+            contentDescription = contentDescription,
+            tint = LightThemeTokens.colors.content,
+            modifier = Modifier.size(2f.gridUnitsAsDp()),
         )
     }
 }

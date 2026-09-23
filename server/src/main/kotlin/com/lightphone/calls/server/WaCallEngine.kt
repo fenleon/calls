@@ -2,15 +2,33 @@ package com.lightphone.calls.server
 
 import android.content.Context
 import android.util.Log
+import android.view.Surface
 import com.lightphone.calls.server.bridge.WaBridge
 import com.lightphone.calls.server.bridge.WaEvent
 import com.lightphone.calls.server.bridge.WaListener
+import com.lightphone.calls.server.bridge.WaVideoUpgradeToken
+import com.lightphone.calls.server.bridge.WaVideoFrame
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicInteger
+
+/** UI reduction of the wire's `<video state=N>` ints (the library's
+ *  `VideoState`: 0 Disabled, 1 Enabled, 2 Paused, 3 UpgradeRequest,
+ *  4 UpgradeAccept, 5 UpgradeReject, 6 Stopped, 7 UpgradeRejectByTimeout,
+ *  8 UpgradeCancel, 9 UpgradeCancelByTimeout, 10 UnknownPeer,
+ *  11 UpgradeRequestV2, 20 Error). The upgrade prompt gates on the
+ *  request states (3/11 — the library's `is_upgrade_request()`); Enabled
+ *  and an accepted upgrade are On; everything else is Off. */
+sealed interface VideoUiState {
+    data object Off : VideoUiState
+    data object On : VideoUiState
+    /** Live peer upgrade request — the token echoes back to `acceptVideo`. */
+    data class UpgradeRequested(val token: WaVideoUpgradeToken) : VideoUiState
+}
 
 object WaCallEngine : WaListener {
     private const val TAG = "WaCallEngine"
@@ -24,6 +42,19 @@ object WaCallEngine : WaListener {
      *  when a call ends. */
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error
+
+    /** The video plane's UI state, reduced from `VideoStateChanged` (see
+     *  [VideoUiState]). */
+    private val _videoState = MutableStateFlow<VideoUiState>(VideoUiState.Off)
+    val videoState: StateFlow<VideoUiState> = _videoState
+
+    /** Peer camera orientation in 90° steps (0..3), updated by the decode
+     *  half — the UI rotates the surface with it. */
+    val peerOrientation = MutableStateFlow(0)
+
+    /** The call's video direction encode tier (SPEC §3.3). Its fps feeds the
+     *  bridge's RTP timestamp stride on `startVideo`/`acceptVideo`. */
+    private val videoTier = VideoTier.DEFAULT
 
     /** Auto-restarts since the last successful pairing — caps the watchdog /
      *  unlink respawn loop when recovery is hopeless. */
@@ -357,6 +388,14 @@ object WaCallEngine : WaListener {
                         _error.value = "Call connected but microphone unavailable — reopen the app"
                     }
                     runCatching { audioLink().start() }
+                    // Video negotiated before the call started (a
+                    // video-from-start offer): the encoder joins the audio
+                    // plane here; the decode half starts when the UI attaches
+                    // its surface (or right below if it already has).
+                    if (_videoState.value is VideoUiState.On) {
+                        startVideoEncoding()
+                        startVideoDecoding()
+                    }
                     // Outgoing attempts log at placement; an answered incoming
                     // call logs the moment it comes up. `CallEnded` never logs.
                     if (!currentCallOutgoing) {
@@ -394,7 +433,14 @@ object WaCallEngine : WaListener {
                     audioLink?.stop()
                     audioLink = null
                     // Release the diagnostics video exercise too, if running.
-                    videoLink?.let { videoLink = null; diagnostics = false; it.stop() }
+                    videoLink?.let { videoLink = null; diagnostics = false; _videoExerciseRunning.value = false; it.stop() }
+                    // The call's video plane: encode + decode halves, surface,
+                    // reduced state — back to a fresh video-less baseline.
+                    encodeLink?.let { encodeLink = null; it.stop() }
+                    stopVideoDecoding()
+                    peerSurface = null
+                    _videoState.value = VideoUiState.Off
+                    peerOrientation.value = 0
                     appContext?.let { WaCallService.tryStop(it) }
                     if (started && logPeer != null && logAt != 0L) {
                         callLog?.updateDuration(
@@ -496,19 +542,35 @@ object WaCallEngine : WaListener {
                     else -> contacts?.merge(list)
                 }
             }
-            // V0 passthroughs: raw video signaling, surfaced to UI observers
-            // via `_events` below — the video UI reduction is a later task.
             is WaEvent.VideoStateChanged -> {
                 Log.i(TAG, "video state: ${event.state}")
+                val next = reduceVideoState(event.state, event.upgrade)
+                _videoState.value = next
+                scope.launch {
+                    if (next is VideoUiState.Off) {
+                        stopVideoEncoding()
+                        stopVideoDecoding()
+                    } else {
+                        // Video On with the UI's surface already attached —
+                        // the decode half starts as soon as both hold.
+                        startVideoDecoding()
+                    }
+                }
             }
             is WaEvent.OutboundVideoDropped -> {
                 Log.i(TAG, "outbound video dropped: ${event.accessUnits}")
+                // The relay shed OUR outbound AUs before transmission — the
+                // peer lost reference data, so the encoder's next frame must
+                // be an IDR (same signal the local overflow path carries).
+                encodeLink?.requestSyncFrame()
+                videoLink?.requestSyncFrame()
             }
             is WaEvent.KeyframePressure -> {
                 // Peer PLI/FIR (relayed): the engine sheds non-IDR AUs on its
                 // own; the encoder can answer with a sync frame ahead of the
-                // 1 s GOP. The decode half will consume the same pressure.
+                // 1 s GOP.
                 Log.i(TAG, "keyframe pressure")
+                encodeLink?.requestSyncFrame()
                 videoLink?.requestSyncFrame()
             }
             else -> Unit
@@ -528,11 +590,162 @@ object WaCallEngine : WaListener {
     fun appContextForVideoLink(): Context =
         appContext ?: throw IllegalStateException("engine not attached")
 
-    // Video encode exercise (V1): runs the H.264 encoder standalone behind the
-    // runtime opt-in diagnostics toggle (Settings) — no call, no `startVideo`.
-    // The bridge consumes nothing without a call, so the AU stream flows into
-    // its drop-oldest queue only; a diagnostics dump file beside it holds the
-    // pushed AUs for the encoder gate (ffprobe). Full call-flow wiring is V2.
+    // Video plane (V2). The encode half ([VideoLink]) and decode half
+    // ([VideoDecodeLink]) run per-call; their lifecycle hangs off the video
+    // state: the encode side starts on `startVideo`/`acceptVideo` (and on
+    // `CallStarted` when video was negotiated up front) and stops on
+    // Off-reducing `VideoStateChanged`/`stopVideo`/`CallEnded`; the decode
+    // side starts when the UI attaches its surface while video is On.
+
+    /** The call's outbound encoder — distinct from the diagnostics exercise
+     *  [videoLink] (which only ever runs call-free). */
+    @Volatile
+    private var encodeLink: VideoLink? = null
+
+    /** The peer-video decoder rendering into the UI's surface. */
+    @Volatile
+    private var decodeLink: VideoDecodeLink? = null
+
+    /** The UI's peer-video surface while the active-call screen shows it. */
+    @Volatile
+    private var peerSurface: Surface? = null
+
+    /** User-level video actions (the UI toggle / upgrade prompt). All
+     *  fire-and-forget on the engine scope; failures surface through
+     *  [_error] and the reduced video state. */
+
+    /** Starts our video direction (mid-call upgrade we initiate): the
+     *  bridge's fps-paced media plane plus the local encoder. */
+    fun startVideo() {
+        scope.launch {
+            try {
+                bridgeOrThrow().startVideo(videoTier.fps.toUInt())
+            } catch (e: Exception) {
+                Log.w(TAG, "startVideo failed: ${e.message}")
+                _videoState.value = VideoUiState.Off
+                _error.value = "video failed"
+                return@launch
+            }
+            startVideoEncoding()
+            _videoState.value = VideoUiState.On
+        }
+    }
+
+    /** Accepts the peer's upgrade request (the prompt's accept tap): the
+     *  echoed token, then the standalone `<video state=1>` the protocol
+     *  wants after a mid-call upgrade completes. */
+    fun acceptVideo() {
+        val token = (_videoState.value as? VideoUiState.UpgradeRequested)?.token ?: return
+        scope.launch {
+            val ok = runCatching {
+                bridgeOrThrow().acceptVideo(token, videoTier.fps.toUInt())
+                bridgeOrThrow().announceVideoEnabled()
+            }.onFailure { Log.w(TAG, "acceptVideo failed: ${it.message}") }.isSuccess
+            if (ok) {
+                startVideoEncoding()
+                _videoState.value = VideoUiState.On
+            } else {
+                _videoState.value = VideoUiState.Off
+                _error.value = "video failed"
+            }
+        }
+    }
+
+    /** Declines the peer's upgrade request (the prompt's decline tap):
+     *  signals video-off — the bridge has no separate reject, and
+     *  `stopVideo` (state 6) is the wire's "not doing video" answer. */
+    fun declineVideo() {
+        _videoState.value = VideoUiState.Off
+        scope.launch { runCatching { bridge?.stopVideo() } }
+    }
+
+    /** Stops our video direction (toggle off): encoder down first, then the
+     *  bridge signaling. Idempotent per the library. */
+    fun stopVideo() {
+        _videoState.value = VideoUiState.Off
+        scope.launch {
+            runCatching { bridge?.stopVideo() }
+            stopVideoEncoding()
+        }
+    }
+
+    /** The UI's peer-video surface. `null` detaches (the SurfaceView went
+     *  away — screen left / surface destroyed). */
+    fun attachPeerSurface(surface: Surface?) {
+        if (surface == null) {
+            peerSurface = null
+            scope.launch { stopVideoDecoding() }
+            return
+        }
+        peerSurface = surface
+        if (_videoState.value is VideoUiState.On) startVideoDecoding()
+    }
+
+    private fun startVideoEncoding() {
+        if (encodeLink != null || fakeCall) return
+        val bridge = bridge ?: return
+        val link = VideoLink(
+            sink = { au -> runCatching { bridge.sendVideoAu(au) }.getOrDefault(false) },
+            onLost = { reason -> onVideoEncodeLost(reason) },
+        )
+        link.start()
+        encodeLink = link
+    }
+
+    /** Camera loss / late start failure (V1-review carry-over): surface it
+     *  honestly — video state off (the UI's toggle un-underlines), an error
+     *  line, and the peer told we stopped. */
+    private fun onVideoEncodeLost(reason: String) {
+        Log.w(TAG, "video encode lost: $reason")
+        encodeLink = null
+        _videoState.value = VideoUiState.Off
+        _error.value = "camera unavailable — video stopped"
+        scope.launch { runCatching { bridge?.stopVideo() } }
+    }
+
+    private fun stopVideoEncoding() {
+        encodeLink?.let { link -> encodeLink = null; link.stop() }
+    }
+
+    private fun stopVideoDecoding() {
+        decodeLink?.let { link -> decodeLink = null; link.stop() }
+    }
+
+    private fun startVideoDecoding() {
+        synchronized(this) {
+            if (decodeLink != null || fakeCall) return
+            val surface = peerSurface ?: return
+            val bridge = bridge ?: return
+            val link = VideoDecodeLink(
+                output = surface,
+                pull = { bridge.recvVideoFrame(50u) },
+                onOrientation = { peerOrientation.value = it },
+                onEnded = { reason ->
+                    Log.w(TAG, "video decode ended: $reason")
+                    decodeLink = null
+                },
+            )
+            link.start()
+            decodeLink = link
+        }
+    }
+
+    /** Maps a raw `VideoState` wire int onto [VideoUiState] (see the enum's
+     *  doc for the table). An upgrade request without a token can't be
+     *  answered — it degrades to Off instead of an unanswerable prompt. */
+    private fun reduceVideoState(state: Int, upgrade: WaVideoUpgradeToken?): VideoUiState = when (state) {
+        1, 4 -> VideoUiState.On // Enabled, UpgradeAccept
+        3, 11 -> upgrade?.let { VideoUiState.UpgradeRequested(it) } ?: VideoUiState.Off
+        else -> VideoUiState.Off
+    }
+
+    // Diagnostics exercises (no call, no traffic): the encoder exercise runs
+    // the H.264 encoder standalone behind the runtime opt-in toggle
+    // (Settings); the decode exercise replays its archived AU capture
+    // through the real decode half into a test screen's SurfaceView. The
+    // bridge consumes nothing without a call, so the encoder's AU stream
+    // flows into its drop-oldest queue only; the capture file beside it
+    // (`video-exercise.h264`) holds the pushed AUs.
 
     /** Runtime opt-in verbose diagnostics — OFF by default (battery rule; the
      *  LP3 runs DEBUGGABLE APKs so BuildConfig.DEBUG is useless). */
@@ -543,8 +756,12 @@ object WaCallEngine : WaListener {
     @Volatile
     private var videoLink: VideoLink? = null
 
-    val videoExerciseRunning: Boolean
-        get() = videoLink != null
+    private val _videoExerciseRunning = MutableStateFlow(false)
+    val videoExerciseRunning: StateFlow<Boolean> = _videoExerciseRunning
+
+    /** Diagnostic note line (camera loss, capture result) — Settings and the
+     *  decode-test screen render it instead of a stale "Recording". */
+    val exerciseNote = MutableStateFlow<String?>(null)
 
     /** Toggles the encoder exercise. Refused while a call is live — the
      *  encoder is released on `CallEnded` too (the reducer's teardown branch). */
@@ -553,11 +770,12 @@ object WaCallEngine : WaListener {
         if (link != null) {
             videoLink = null
             diagnostics = false
+            _videoExerciseRunning.value = false
             link.stop()
             return false
         }
-        if (currentCallPeer != null || currentCallStarted) return videoExerciseRunning
-        val bridge = bridge ?: return videoExerciseRunning
+        if (currentCallPeer != null || currentCallStarted) return videoExerciseRunning.value
+        val bridge = bridge ?: return videoExerciseRunning.value
         val dump = appContextForVideoLink().filesDir.resolve("video-exercise.h264")
         dump.delete()
         val started = VideoLink(
@@ -570,12 +788,93 @@ object WaCallEngine : WaListener {
                 dropped && currentCallStarted
             },
             dumpFile = dump,
+            onLost = { reason ->
+                // V1-review carry-over: camera loss must not leave Settings
+                // claiming "Recording" — stop and surface the note.
+                videoLink = null
+                diagnostics = false
+                _videoExerciseRunning.value = false
+                exerciseNote.value = "encoder test stopped: $reason"
+            },
         )
-        return runCatching { started.start(); videoLink = started; diagnostics = true }
+        return runCatching {
+            started.start()
+            videoLink = started
+            diagnostics = true
+            _videoExerciseRunning.value = true
+            exerciseNote.value = null
+        }
             .map { true }
             .getOrElse {
                 Log.w(TAG, "video exercise failed to start: ${it.message}")
                 false
             }
+    }
+
+    @Volatile
+    private var decodeExercise: VideoDecodeLink? = null
+
+    val decodeExerciseRunning: Boolean
+        get() = decodeExercise != null
+
+    /** Starts the decode exercise: replays the encoder test's archived AU
+     *  capture at 15 fps through the real decode half into [surface]. */
+    fun startDecodeExercise(surface: Surface) {
+        synchronized(this) {
+            Log.i(TAG, "decode exercise requested: running=${decodeExercise != null} peer=${currentCallPeer != null}")
+            if (decodeExercise != null) return
+            if (currentCallPeer != null || currentCallStarted) {
+                exerciseNote.value = "refused — a call is live"
+                return
+            }
+            val file = appContextForVideoLink().filesDir.resolve("video-exercise.h264")
+            if (!file.exists()) {
+                exerciseNote.value = "no capture — run the encoder test first"
+                return
+            }
+            val aus = runCatching { parseAnnexBAus(file.readBytes()) }
+                .getOrElse {
+                    Log.w(TAG, "decode exercise: capture unreadable: ${it.message}")
+                    exerciseNote.value = "capture unreadable"
+                    return
+                }
+            if (aus.isEmpty()) {
+                exerciseNote.value = "capture is empty"
+                return
+            }
+            exerciseNote.value = null
+            val total = aus.size
+            val index = AtomicInteger(0)
+            val startedAt = System.nanoTime()
+            val frameNs = 1_000_000_000L / VideoTier.DEFAULT.fps
+            val link = VideoDecodeLink(
+                output = surface,
+                pull = {
+                    val i = index.getAndIncrement()
+                    if (i >= total) {
+                        if (i == total) exerciseNote.value = "capture finished — $total AUs"
+                        null
+                    } else {
+                        // Pace at the capture's fps so the render looks like
+                        // the recorded stream instead of a burst.
+                        val waitNs = startedAt + i * frameNs - System.nanoTime()
+                        if (waitNs > 0) Thread.sleep(waitNs / 1_000_000, (waitNs % 1_000_000).toInt())
+                        val au = aus[i]
+                        WaVideoFrame(au.data, au.keyframe, 0u)
+                    }
+                },
+                onEnded = { reason ->
+                    decodeExercise = null
+                    exerciseNote.value = reason
+                },
+            )
+            link.start()
+            decodeExercise = link
+            Log.i(TAG, "decode exercise started: $total AUs")
+        }
+    }
+
+    fun stopDecodeExercise() {
+        decodeExercise?.let { decodeExercise = null; it.stop() }
     }
 }
