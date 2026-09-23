@@ -75,6 +75,13 @@ class SettingsViewModel : LightViewModel<Unit>() {
 
     /** Dev design aid: fake incoming call (see [WaCallEngine.debugIncomingCall]). */
     fun demoCall() = WaCallEngine.debugIncomingCall()
+
+    /** Diagnostics video-encoder exercise (see [WaCallEngine.toggleVideoExercise]). */
+    val videoExercise = MutableStateFlow(WaCallEngine.videoExerciseRunning)
+
+    fun toggleVideoExercise() {
+        videoExercise.value = WaCallEngine.toggleVideoExercise()
+    }
 }
 
 /** Account status. The pairing itself stays event-driven (the engine emits
@@ -94,6 +101,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val account by viewModel.account.collectAsState()
         val accountName by viewModel.accountName.collectAsState()
         val engineError by viewModel.engineError.collectAsState()
+        val videoExercise by viewModel.videoExercise.collectAsState()
 
         LightTheme(colors = themeColors) {
             Column(
@@ -163,6 +171,19 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                             .lightClickable(onClick = { viewModel.demoCall() }),
                     ) {
                         LightText(text = "Demo Call", variant = LightTextVariant.Heading)
+                    }
+                    Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .lightClickable(onClick = { viewModel.toggleVideoExercise() }),
+                    ) {
+                        LightText(text = "Video encoder test", variant = LightTextVariant.Heading)
+                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+                        LightText(
+                            text = if (videoExercise) "Recording — tap to stop" else "Diagnostics",
+                            variant = LightTextVariant.Detail,
+                        )
                     }
                     engineError?.let { message ->
                         Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))

@@ -393,6 +393,8 @@ object WaCallEngine : WaListener {
                     CallTone.playDisconnect()
                     audioLink?.stop()
                     audioLink = null
+                    // Release the diagnostics video exercise too, if running.
+                    videoLink?.let { videoLink = null; diagnostics = false; it.stop() }
                     appContext?.let { WaCallService.tryStop(it) }
                     if (started && logPeer != null && logAt != 0L) {
                         callLog?.updateDuration(
@@ -513,5 +515,60 @@ object WaCallEngine : WaListener {
             audioLink?.let { return it }
             return AudioLink(bridgeOrThrow()).also { audioLink = it }
         }
+    }
+
+    /** [VideoLink]'s camera-manager lookup — the engine owns the context. */
+    fun appContextForVideoLink(): Context =
+        appContext ?: throw IllegalStateException("engine not attached")
+
+    // Video encode exercise (V1): runs the H.264 encoder standalone behind the
+    // runtime opt-in diagnostics toggle (Settings) — no call, no `startVideo`.
+    // The bridge consumes nothing without a call, so the AU stream flows into
+    // its drop-oldest queue only; a diagnostics dump file beside it holds the
+    // pushed AUs for the encoder gate (ffprobe). Full call-flow wiring is V2.
+
+    /** Runtime opt-in verbose diagnostics — OFF by default (battery rule; the
+     *  LP3 runs DEBUGGABLE APKs so BuildConfig.DEBUG is useless). */
+    @Volatile
+    var diagnostics: Boolean = false
+        private set
+
+    @Volatile
+    private var videoLink: VideoLink? = null
+
+    val videoExerciseRunning: Boolean
+        get() = videoLink != null
+
+    /** Toggles the encoder exercise. Refused while a call is live — the
+     *  encoder is released on `CallEnded` too (the reducer's teardown branch). */
+    fun toggleVideoExercise(): Boolean {
+        val link = videoLink
+        if (link != null) {
+            videoLink = null
+            diagnostics = false
+            link.stop()
+            return false
+        }
+        if (currentCallPeer != null || currentCallStarted) return videoExerciseRunning
+        val bridge = bridge ?: return videoExerciseRunning
+        val dump = appContextForVideoLink().filesDir.resolve("video-exercise.h264")
+        dump.delete()
+        val started = VideoLink(
+            sink = { au ->
+                val dropped = runCatching { bridge.sendVideoAu(au) }.getOrDefault(false)
+                // Without a live call the bridge's queue has no consumer, so
+                // its drop-oldest overflow is not a lost reference chain —
+                // don't ask the encoder for sync frames over it. (A real call
+                // passes the same signal through verbatim.)
+                dropped && currentCallStarted
+            },
+            dumpFile = dump,
+        )
+        return runCatching { started.start(); videoLink = started; diagnostics = true }
+            .map { true }
+            .getOrElse {
+                Log.w(TAG, "video exercise failed to start: ${it.message}")
+                false
+            }
     }
 }
