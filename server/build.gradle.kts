@@ -25,6 +25,9 @@ val buildRust by tasks.registering(Exec::class) {
     commandLine("bash", "wa-bridge/build-android.sh")
     environment("ANDROID_HOME", System.getenv("ANDROID_HOME") ?: "${rootProject.projectDir}/../tools/android-sdk")
     inputs.dir(rootProject.file("rust/wa-bridge/src"))
+    // The vendored protocol crates are compiled into the .so too — without them a
+    // whatsapp-rust/wacore edit leaves the Gradle task up-to-date with stale code.
+    inputs.files(rootProject.fileTree("rust/whatsapp-rust") { exclude("target") })
     inputs.files(rootProject.file("rust/wa-bridge/Cargo.toml"), rootProject.file("rust/wa-bridge/Cargo.lock"), rootProject.file("rust/wa-bridge/build-android.sh"))
     outputs.file("src/main/java/com/lightphone/calls/server/bridge/wa_bridge.kt")
     outputs.files("src/main/jniLibs/arm64-v8a/libwa_bridge.so", "src/main/jniLibs/x86_64/libwa_bridge.so")

@@ -776,6 +776,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -796,6 +798,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
 fun uniffi_wa_bridge_checksum_method_wabridge_accept_call(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_account(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_account_name(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_logout(
 ): Short
@@ -886,6 +890,8 @@ fun uniffi_wa_bridge_fn_constructor_wabridge_new(`listener`: Long,uniffi_out_err
 fun uniffi_wa_bridge_fn_method_wabridge_accept_call(`ptr`: Pointer,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_account(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_wa_bridge_fn_method_wabridge_account_name(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_logout(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1050,6 +1056,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_account() != 46385.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_account_name() != 22574.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_logout() != 42824.toShort()) {
@@ -1573,6 +1582,12 @@ public interface WaBridgeInterface {
     fun `account`(): kotlin.String?
     
     /**
+     * Own WhatsApp profile name (push name) once known — the "Paired as"
+     * line. Empty before pairing (the caller falls back to the pn).
+     */
+    fun `accountName`(): kotlin.String?
+    
+    /**
      * User-initiated unpair: deregister the device with the server
      * (`Client::logout` sends the remove-companion IQ, so the entry
      * disappears from the primary's "Linked devices" list) and then wipe
@@ -1800,6 +1815,22 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_account(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Own WhatsApp profile name (push name) once known — the "Paired as"
+     * line. Empty before pairing (the caller falls back to the pn).
+     */override fun `accountName`(): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_account_name(
         it, _status)
 }
     }

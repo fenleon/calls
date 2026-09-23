@@ -1,27 +1,30 @@
 package com.lightphone.calls.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.lifecycle.viewModelScope
+import com.lightphone.calls.R
 import com.lightphone.calls.server.WaCallEngine
 import com.lightphone.calls.server.bridge.WaEvent
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
+import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.ui.LightBarButton
+import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
@@ -38,14 +41,20 @@ import kotlinx.coroutines.launch
 class SettingsViewModel : LightViewModel<Unit>() {
     /** Own account once known — null while unpaired. */
     val account = MutableStateFlow<String?>(WaCallEngine.account())
+
+    /** Own WhatsApp profile name once known — the "Paired as" line; the pn
+     *  (from [account]) is the fallback. */
+    val accountName = MutableStateFlow<String?>(WaCallEngine.accountName())
     val engineError = WaCallEngine.error
-    val version = MutableStateFlow(WaCallEngine.version())
 
     init {
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
                 when (event) {
-                    is WaEvent.Paired -> account.value = WaCallEngine.account()
+                    is WaEvent.Paired -> {
+                        account.value = WaCallEngine.account()
+                        accountName.value = WaCallEngine.accountName()
+                    }
                     is WaEvent.Unlinked -> account.value = null
                     // Unpair parks the flow here until the respawn — already
                     // unpaired as far as the UI is concerned.
@@ -65,7 +74,7 @@ class SettingsViewModel : LightViewModel<Unit>() {
     fun unpair() = WaCallEngine.unpair()
 
     /** Dev design aid: fake incoming call (see [WaCallEngine.debugIncomingCall]). */
-    fun debugIncomingCall() = WaCallEngine.debugIncomingCall()
+    fun demoCall() = WaCallEngine.debugIncomingCall()
 }
 
 /** Account status. The pairing itself stays event-driven (the engine emits
@@ -83,9 +92,8 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val account by viewModel.account.collectAsState()
+        val accountName by viewModel.accountName.collectAsState()
         val engineError by viewModel.engineError.collectAsState()
-        val version by viewModel.version.collectAsState()
-        var versionTaps by remember { mutableStateOf(0) }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -106,81 +114,115 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                         .padding(horizontal = 2f.gridUnitsAsDp()),
                 ) {
                     Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .lightClickable(
-                                enabled = account == null,
-                                onClick = {
-                                    // Connect: fresh QR set via a pairing
-                                    // restart; the pairing screen (pushed
-                                    // now) observes the new QR rotations.
-                                    viewModel.connect()
-                                    navigateTo(screenFactory = { activity ->
-                                        PairingScreen(activity, null)
-                                    })
-                                },
-                            ),
-                    ) {
-                        LightText(text = "Link WhatsApp", variant = LightTextVariant.Heading)
-                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                        LightText(
-                            text = account?.let { "Paired as $it" } ?: "not connected",
-                            variant = LightTextVariant.Detail,
-                        )
-                    }
-                    engineError?.let { message ->
-                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
-                        LightText(text = message, variant = LightTextVariant.Detail)
-                    }
-                    account?.let { paired ->
-                        // Two-tap confirm (no long-press on the LP3): the row
-                        // arms on the first tap and acts on the second.
-                        var confirmUnpair by remember { mutableStateOf(false) }
-                        LaunchedEffect(account) { confirmUnpair = false }
-                        Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    if (account == null) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .lightClickable(
                                     onClick = {
-                                        if (confirmUnpair) {
-                                            viewModel.unpair()
-                                        } else {
-                                            confirmUnpair = true
+                                        // Connect: fresh QR set via a pairing
+                                        // restart; the pairing screen (pushed
+                                        // now) observes the new QR rotations.
+                                        viewModel.connect()
+                                        navigateTo(screenFactory = { activity ->
+                                            PairingScreen(activity, null)
+                                        })
+                                    },
+                                ),
+                        ) {
+                            LightText(text = "Link WhatsApp", variant = LightTextVariant.Heading)
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .lightClickable(
+                                    onClick = {
+                                        navigateTo(screenFactory = { activity ->
+                                            UnlinkConfirmPanel(activity)
+                                        }) { confirmed ->
+                                            if (confirmed) viewModel.unpair()
                                         }
                                     },
                                 ),
                         ) {
-                            LightText(
-                                text = if (confirmUnpair) "Tap again to unpair" else "Unpair",
-                                variant = LightTextVariant.Heading,
-                            )
+                            LightText(text = "Unlink WhatsApp", variant = LightTextVariant.Heading)
                             Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
                             LightText(
-                                text = if (confirmUnpair) "$paired will be unlinked from your phone"
-                                else "Unlink this device and erase its session",
+                                text = "Paired as ${
+                                    accountName ?: account?.substringBefore('@').orEmpty()
+                                }",
                                 variant = LightTextVariant.Detail,
                             )
                         }
                     }
-                    Spacer(modifier = Modifier.weight(1f))
-                    LightText(
-                        text = "wa-bridge $version",
-                        variant = LightTextVariant.Detail,
-                        // Dev design aid: five taps fire a fake incoming
-                        // call — ring/active panels render with no bridge,
-                        // no network, no audio, no log entries.
-                        modifier = Modifier.lightClickable {
-                            versionTaps += 1
-                            if (versionTaps >= 5) {
-                                versionTaps = 0
-                                viewModel.debugIncomingCall()
-                            }
-                        },
-                    )
-                    Spacer(modifier = Modifier.padding(bottom = 1f.gridUnitsAsDp()))
+                    Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .lightClickable(onClick = { viewModel.demoCall() }),
+                    ) {
+                        LightText(text = "Demo Call", variant = LightTextVariant.Heading)
+                    }
+                    engineError?.let { message ->
+                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+                        LightText(text = message, variant = LightTextVariant.Detail)
+                    }
                 }
+            }
+        }
+    }
+}
+
+/** The unlink confirmation panel: centered
+ *  "Are you sure you want to unlink this device and erase its session?" with
+ *  the LP3 X (dismiss) and triangle (confirm) — the same panel grammar as the
+ *  chats tool's logout confirm. Result: true = unlink. */
+class UnlinkConfirmPanel(
+    sealedActivity: SealedLightActivity,
+) : SimpleLightScreen<Boolean>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+        val confirmTriangle = painterResource(R.drawable.ic_lp3_confirm_triangle)
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    LightText(
+                        text = "Are you sure you want to unlink this device and erase its session?",
+                        variant = LightTextVariant.Copy,
+                        align = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                    )
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack(false) },
+                            contentDescription = "Cancel",
+                        ),
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmTriangle,
+                            onClick = { goBack(true) },
+                            contentDescription = "Unlink",
+                        ),
+                    ),
+                )
             }
         }
     }

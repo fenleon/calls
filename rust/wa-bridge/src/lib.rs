@@ -568,19 +568,17 @@ impl WaBridge {
             let bot = Bot::builder()
                 .with_backend(store)
                 // The companion name WhatsApp shows in "Linked devices" comes
-                // from these props — the default os ("rust") renders as
-                // "Other device". Advertise the real device everywhere.
+                // from these props (they ride the registration payload only —
+                // changing them needs an unlink + relink). With DESKTOP the
+                // entry reads just the os string ("Light Phone 3"); browser
+                // platform types (e.g. CHROME) prefix the os with the browser
+                // name ("Google Chrome (Light Phone 3)"), and UNKNOWN renders
+                // "Other device" and drops the os entirely.
                 .with_device_props(
                     whatsapp_rust::wacore::store::DevicePropsOverride::new()
                         .with_os("Light Phone 3")
-                        // Device label (verified by relink tests): with the
-                        // platform UNKNOWN both the name and platform fields
-                        // read "Other device" — WhatsApp ignores the os
-                        // string there. With CHROME the entry reads
-                        // "Google Chrome (Light Phone 3)", which is the best
-                        // achievable label; see WORKLOG outstanding item.
                         .with_platform_type(
-                            whatsapp_rust::waproto::whatsapp::device_props::PlatformType::CHROME,
+                            whatsapp_rust::waproto::whatsapp::device_props::PlatformType::DESKTOP,
                         ),
                 )
                 .on_qr_code(move |code, _timeout| {
@@ -878,6 +876,13 @@ impl WaBridge {
         }
         let handle = self.handle.lock().unwrap().as_ref()?.client();
         handle.pn().map(|jid| jid.to_string())
+    }
+
+    /// Own WhatsApp profile name (push name) once known — the "Paired as"
+    /// line. Empty before pairing (the caller falls back to the pn).
+    pub fn account_name(&self) -> Option<String> {
+        let name = self.client().ok()?.push_name();
+        if name.is_empty() { None } else { Some(name) }
     }
 
     pub fn version(&self) -> String {

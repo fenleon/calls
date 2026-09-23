@@ -174,6 +174,10 @@ object WaCallEngine : WaListener {
      *  store at attach time; a fresh pairing gets it with `Paired`. */
     fun account(): String? = bridge?.account()
 
+    /** Own WhatsApp profile name once known — the Settings "Paired as" line
+     *  (the pn is the fallback). */
+    fun accountName(): String? = bridge?.accountName()
+
     /** The persisted call log, newest last — rendered by the home screen. */
     fun callLogEntries(): List<CallLogEntry> = callLog?.all() ?: emptyList()
 
