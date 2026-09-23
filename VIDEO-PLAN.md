@@ -143,6 +143,20 @@ the answer/connect tap on both emulator and LP3 (Android 14 while-in-use rule).
 
 ## V4 — LP3 hardening (~2–3 days)
 
+Real-account matrix from V3 (needs the PLAN.md rig; emulator can only gate the
+mechanics — see the V3 report):
+
+- [ ] out-upgrade: peer accepts our mid-call upgrade (video flows both ways)
+- [ ] out-upgrade: peer rejects our mid-call upgrade (clean downgrade, no orphaned signaling)
+- [ ] out-upgrade: peer never answers the upgrade (timeout — clean downgrade)
+- [ ] in-upgrade: we accept the peer's upgrade (CAMERA grant → encoder joins, FGS elevated)
+- [ ] in-upgrade: we decline the peer's upgrade (state-6 decline; peer exits its wait)
+- [ ] in-upgrade: we never answer the prompt (timeout — clean)
+- [ ] peer stop mid-call: our encode/decode stop, surface blanks, state resets
+- [ ] downgrade cleanup: stop → camera released, stride state reset, no stale AUs
+- [ ] FGS starts as microphone|camera from the answer/connect tap on the LP3 (Android 14 while-in-use rule)
+- [ ] glare on-device: cancel during a pending video upgrade (`EnableAwaitingAccept`) terminates cleanly (no orphaned video signaling, flags reset)
+
 - Orientation convention verified vs a real call; lipsync sanity (audio path
   unchanged — watch playout trim interaction).
 - Confirm the peer's client exits its upgrade-wait cleanly after our

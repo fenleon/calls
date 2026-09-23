@@ -1,5 +1,6 @@
 package com.lightphone.calls.screens
 
+import android.Manifest
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -52,6 +53,7 @@ import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.thelightphone.sdk.ui.rememberLightHapticClick
+import com.thelightphone.sdk.rememberPermissionRequestLauncher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -77,6 +79,10 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     /** The video plane's reduced state + peer orientation (engine-owned). */
     val videoState = WaCallEngine.videoState
     val peerOrientation = WaCallEngine.peerOrientation
+
+    // Increments on every video tap that finds CAMERA ungranted, so each tap
+    // re-arms the permission request even after a denial (the mic pattern).
+    val cameraRequestTick = MutableStateFlow(0)
 
     init {
         // The engine's error line mirrors here so in-call failures (mic FGS
@@ -146,16 +152,33 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     }
 
     /** Video toggle (icon row): off → start our direction; on → stop. The
-     *  upgrade prompt is its own accept/decline row — the toggle ignores it. */
+     *  upgrade prompt is its own accept/decline row — the toggle ignores it.
+     *  Starting (and accepting a peer upgrade) opens our camera, so the tap
+     *  first needs the CAMERA grant: ungranted taps request it (mic
+     *  grammar), the engine holds the no-grant-no-camera backstop. */
     fun toggleVideo() {
-        when (videoState.value) {
+        when (val state = videoState.value) {
             is VideoUiState.On -> WaCallEngine.stopVideo()
-            is VideoUiState.Off -> WaCallEngine.startVideo()
+            is VideoUiState.Off -> viewModelScope.launch {
+                if (cameraPermissionGranted()) {
+                    WaCallEngine.startVideo()
+                } else {
+                    cameraRequestTick.value += 1
+                }
+            }
             is VideoUiState.UpgradeRequested -> Unit
         }
     }
 
-    fun acceptVideo() = WaCallEngine.acceptVideo()
+    fun acceptVideo() {
+        viewModelScope.launch {
+            if (cameraPermissionGranted()) {
+                WaCallEngine.acceptVideo()
+            } else {
+                cameraRequestTick.value += 1
+            }
+        }
+    }
     fun declineVideo() = WaCallEngine.declineVideo()
 
     /** The peer-video SurfaceView's lifecycle → the engine's decode half. */
@@ -191,6 +214,12 @@ class ActiveCallScreen(
         val bluetoothConnected by LightBluetooth.connected.collectAsState()
         val videoState by viewModel.videoState.collectAsState()
         val orientation by viewModel.peerOrientation.collectAsState()
+        val cameraRequestTick by viewModel.cameraRequestTick.collectAsState()
+        val cameraLauncher = rememberPermissionRequestLauncher(Manifest.permission.CAMERA)
+
+        LaunchedEffect(cameraRequestTick) {
+            if (cameraRequestTick > 0) cameraLauncher?.launch()
+        }
         val videoOn = videoState is VideoUiState.On
         val upgradeRequested = videoState is VideoUiState.UpgradeRequested
         // Native "call ended" panel (PHONE-PANELS.md §5.3: the bundle's

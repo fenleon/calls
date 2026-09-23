@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -23,6 +24,7 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
+import com.thelightphone.sdk.rememberPermissionRequestLauncher
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
@@ -76,12 +78,26 @@ class SettingsViewModel : LightViewModel<Unit>() {
     /** Dev design aid: fake incoming call (see [WaCallEngine.debugIncomingCall]). */
     fun demoCall() = WaCallEngine.debugIncomingCall()
 
+    /** Dev design aid: fake incoming *video* offer — the emulator path for
+     *  the answer flow's CAMERA request. */
+    fun demoVideoCall() = WaCallEngine.debugIncomingVideoCall()
+
     /** Diagnostics video-encoder exercise (see [WaCallEngine.toggleVideoExercise]). */
     val videoExercise = WaCallEngine.videoExerciseRunning
     val exerciseNote = WaCallEngine.exerciseNote
 
+    // Same re-arm pattern as the call screens: the encoder test opens the
+    // camera, so an ungranted tap requests CAMERA first.
+    val cameraRequestTick = MutableStateFlow(0)
+
     fun toggleVideoExercise() {
-        WaCallEngine.toggleVideoExercise()
+        viewModelScope.launch {
+            if (cameraPermissionGranted()) {
+                WaCallEngine.toggleVideoExercise()
+            } else {
+                cameraRequestTick.value += 1
+            }
+        }
     }
 }
 
@@ -104,6 +120,12 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val engineError by viewModel.engineError.collectAsState()
         val videoExercise by viewModel.videoExercise.collectAsState()
         val exerciseNote by viewModel.exerciseNote.collectAsState()
+        val cameraRequestTick by viewModel.cameraRequestTick.collectAsState()
+        val cameraLauncher = rememberPermissionRequestLauncher(android.Manifest.permission.CAMERA)
+
+        LaunchedEffect(cameraRequestTick) {
+            if (cameraRequestTick > 0) cameraLauncher?.launch()
+        }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -173,6 +195,14 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                             .lightClickable(onClick = { viewModel.demoCall() }),
                     ) {
                         LightText(text = "Demo Call", variant = LightTextVariant.Heading)
+                    }
+                    Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .lightClickable(onClick = { viewModel.demoVideoCall() }),
+                    ) {
+                        LightText(text = "Demo video call", variant = LightTextVariant.Heading)
                     }
                     Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
                     Column(

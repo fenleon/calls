@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -23,11 +24,16 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Fronts an active call (mic capture while foreground-visible). -->
+        <!-- Fronts an active call (mic + camera capture while
+             foreground-visible). Both while-in-use types are declared; the
+             type set passed to startForeground is the granted subset —
+             camera only joins once CAMERA is granted (Android 14 throws
+             SecurityException otherwise), so audio-only calls run
+             microphone-only. -->
         <service
             android:name=".WaCallService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone|camera" />
 
         <!-- AOSP runtime-permission host for the SDK permission flow (the
              screens request RECORD_AUDIO through it). Translucent so the

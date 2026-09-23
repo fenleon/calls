@@ -41,13 +41,16 @@ class ServerBootstrapProvider : ContentProvider() {
             // and haptics preferences come from the real device.
             provideSdkSettings = { RelaySdkServerSettings(it) }
             onDeviceKeyEvent = { _, event -> PlatformRelay.sendDeviceKeyEvent(event) }
-            // Runtime permission flow: the call screens request RECORD_AUDIO
-            // through the SDK flow; this APK hosts the AOSP dialog activity
-            // (the WifiPermissionActivity pattern) and narrows the grantable
-            // set to the mic.
+            // Runtime permission flow: the call screens request RECORD_AUDIO /
+            // CAMERA through the SDK flow; this APK hosts the AOSP dialog
+            // activity (the WifiPermissionActivity pattern) and narrows the
+            // grantable set to the call permissions. CAMERA must be listed
+            // here or GetPermission reports BlockedByServer even with the
+            // platform grant in hand (the video surfaces' tap gates read it).
             permissionActivity = WaPermissionActivity::class.java
             androidPermissionAllowed = { _, permissionName ->
-                permissionName == android.Manifest.permission.RECORD_AUDIO
+                permissionName == android.Manifest.permission.RECORD_AUDIO ||
+                    permissionName == android.Manifest.permission.CAMERA
             }
         }
         PlatformRelay.bind(context)

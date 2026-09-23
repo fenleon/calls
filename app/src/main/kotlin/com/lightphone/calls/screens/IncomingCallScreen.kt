@@ -43,22 +43,32 @@ class IncomingCallViewModel : LightViewModel<Unit>() {
     // Increments on every tap that finds the mic ungranted, so each tap
     // re-arms the permission request even after a denial.
     val permissionRequestTick = MutableStateFlow(0)
+    // Same re-arm pattern for CAMERA on a video offer (a video answer opens
+    // our camera too, so the grant must be in hand before the accept).
+    val cameraRequestTick = MutableStateFlow(0)
 
     fun onAnswerTapped() {
         if (busy.value) return
         viewModelScope.launch {
-            if (micPermissionGranted()) {
-                busy.value = true
-                try {
-                    // On success `CallStarted` routes to the active-call
-                    // screen (observed below); on failure stay and say so.
-                    WaCallEngine.acceptCall()
-                } catch (e: Exception) {
-                    error.value = "could not answer"
-                    busy.value = false
+            when {
+                !micPermissionGranted() -> permissionRequestTick.value += 1
+                // Video offer: the CAMERA grant rides the answer flow (same
+                // tap-twice grammar as the mic). A denial keeps asking on
+                // the next tap — the accept only proceeds with the grant;
+                // the engine answers audio-only if it ever sees it ungranted.
+                WaCallEngine.incomingVideoOffer && !cameraPermissionGranted() ->
+                    cameraRequestTick.value += 1
+                else -> {
+                    busy.value = true
+                    try {
+                        // On success `CallStarted` routes to the active-call
+                        // screen (observed below); on failure stay and say so.
+                        WaCallEngine.acceptCall()
+                    } catch (e: Exception) {
+                        error.value = "could not answer"
+                        busy.value = false
+                    }
                 }
-            } else {
-                permissionRequestTick.value += 1
             }
         }
     }
@@ -83,10 +93,12 @@ class IncomingCallScreen(
         val busy by viewModel.busy.collectAsState()
         val error by viewModel.error.collectAsState()
         val permissionRequestTick by viewModel.permissionRequestTick.collectAsState()
+        val cameraRequestTick by viewModel.cameraRequestTick.collectAsState()
         // Peer gave up (CallEnded): flash the native "call ended" panel
         // before the log returns (PHONE-PANELS.md §5.3).
         var ended by remember { mutableStateOf(false) }
         val permissionLauncher = rememberPermissionRequestLauncher(Manifest.permission.RECORD_AUDIO)
+        val cameraLauncher = rememberPermissionRequestLauncher(Manifest.permission.CAMERA)
 
         // The call coming up (accept → `CallStarted`) is routed by home's
         // always-alive ViewModel via `LightGlobalRoute` (clearToRoot — this
@@ -103,6 +115,9 @@ class IncomingCallScreen(
         }
         LaunchedEffect(permissionRequestTick) {
             if (permissionRequestTick > 0) permissionLauncher?.launch()
+        }
+        LaunchedEffect(cameraRequestTick) {
+            if (cameraRequestTick > 0) cameraLauncher?.launch()
         }
 
         // Native Phone incoming grammar (calls/PHONE-PANELS.md §1/§5):

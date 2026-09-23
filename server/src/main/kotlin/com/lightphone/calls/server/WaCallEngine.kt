@@ -58,9 +58,11 @@ object WaCallEngine : WaListener {
 
     /** The incoming offer advertised video — the answer defaults to
      *  `acceptCall(withVideo = true)` for it, so the answer flow routes the
-     *  offer's video through without the screen needing to know. */
+     *  offer's video through without the screen needing to know. Read by the
+     *  incoming screen to gate the answer tap on the CAMERA grant. */
     @Volatile
-    private var incomingVideoOffer = false
+    var incomingVideoOffer = false
+        private set
 
     /** Explicit user video consent for the live call: answering a video
      *  offer, an outgoing with-video placement, an accepted upgrade, or the
@@ -269,25 +271,29 @@ object WaCallEngine : WaListener {
     suspend fun acceptCall(withVideo: Boolean = incomingVideoOffer) {
         // Fake call (dev design aid): no bridge to accept — the CallStarted
         // lands directly on the event flow and the screens run for real.
+        // The demo answer still runs the real call FGS so the emulator
+        // exercises the notification + FGS type from the answer tap (the
+        // fake end paths below stop it).
         if (fakeCall) {
             Ringer.stop()
+            appContext?.let { WaCallService.tryStart(it) }
             _events.value = WaEvent.CallStarted(callId = "fake")
             return
         }
-        // Answering a video offer (the default routes the offer's `isVideo`
-        // through): record consent and pre-warm the encoder — the camera
-        // opens (~300–800 ms) while the accept signaling goes out, so the
-        // peer waits for neither. Pre-accept AUs buffer in the bridge's
-        // drop-oldest queue and flush on media attach.
-        if (withVideo) {
+        // CAMERA ungranted (denied in the answer flow, or a server-side race
+        // behind the UI's request): answer audio-only — never advertise a
+        // video direction we cannot open a camera for. The UI requests the
+        // grant before this call; this is the honest fallback.
+        val video = withVideo && cameraGranted()
+        if (video) {
             videoConsent = true
             startVideoEncoding()
         }
         try {
-            bridgeOrThrow().acceptCall(withVideo)
+            bridgeOrThrow().acceptCall(video)
         } catch (e: Exception) {
             // The accept failed — never leave a consented camera running.
-            if (withVideo) {
+            if (video) {
                 videoConsent = false
                 scope.launch { stopVideoEncoding() }
             }
@@ -347,10 +353,19 @@ object WaCallEngine : WaListener {
             dropCurrentCall()
             fakeCall = false
             Ringer.stop()
+            appContext?.let { WaCallService.tryStop(it) }
             return
         }
         Ringer.stop()
         scope.launch { runCatching { bridgeOrThrow().rejectCall() } }
+    }
+
+    /** Dev design aid: fake incoming *video* offer (the emulator path for
+     *  the answer flow's CAMERA request — a real video offer needs a real
+     *  caller; the audio demo covers the plain answer). */
+    fun debugIncomingVideoCall() {
+        fakeCall = true
+        onEvent(WaEvent.IncomingCall(peer = "15550102030", isVideo = true))
     }
 
     /** Fire-and-forget hangup of the active call — the `CallEnded` event
@@ -361,6 +376,7 @@ object WaCallEngine : WaListener {
             dropCurrentCall()
             fakeCall = false
             CallTone.playDisconnect()
+            appContext?.let { WaCallService.tryStop(it) }
             _events.value = WaEvent.CallEnded(reason = "ended")
             return
         }
@@ -379,6 +395,14 @@ object WaCallEngine : WaListener {
 
     private fun bridgeOrThrow(): WaBridge =
         bridge ?: throw IllegalStateException("WhatsApp is not started")
+
+    /** CAMERA runtime grant, read off the app context. The screens request
+     *  it through the SDK launcher (mirroring the mic flow); this is the
+     *  server-side backstop that keeps a camera open from ever happening
+     *  without the grant. */
+    private fun cameraGranted(): Boolean =
+        appContext?.checkSelfPermission(android.Manifest.permission.CAMERA) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     override fun onEvent(event: WaEvent) {
         when (event) {
@@ -590,6 +614,12 @@ object WaCallEngine : WaListener {
                 _videoState.value = next
                 scope.launch {
                     if (next is VideoUiState.Off) {
+                        // The video plane went down (peer stop, upgrade
+                        // reject/cancel/timeout, our stop): consent falls
+                        // with it — the glare-cancel contract says no video
+                        // signaling outlives the negotiation, and a later
+                        // enable is always an explicit user action.
+                        videoConsent = false
                         stopVideoEncoding()
                         stopVideoDecoding()
                     } else {
@@ -729,6 +759,17 @@ object WaCallEngine : WaListener {
     private fun startVideoEncoding() {
         if (encodeLink != null || fakeCall) return
         val bridge = bridge ?: return
+        // Backstop behind the screens' CAMERA request flows: no grant, no
+        // camera open — video degrades honestly (Off + error line), audio
+        // unaffected. The mid-call upgrade caller sees the same flash.
+        if (!cameraGranted()) {
+            _videoState.value = VideoUiState.Off
+            _error.value = "camera permission needed"
+            return
+        }
+        // Camera use is about to start: the call FGS claims its camera type
+        // now, while the grant is in hand (Android 14 while-in-use rule).
+        appContext?.let { WaCallService.elevateToCamera(it) }
         val link = VideoLink(
             sink = { au -> runCatching { bridge.sendVideoAu(au) }.getOrDefault(false) },
             onLost = { reason -> onVideoEncodeLost(reason) },

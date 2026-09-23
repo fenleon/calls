@@ -1,11 +1,14 @@
 package com.lightphone.calls.server
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.wifi.WifiManager
@@ -14,15 +17,23 @@ import android.os.PowerManager
 import android.util.Log
 
 /**
- * The `microphone` foreground service fronting an active call. Started from
- * [WaCallEngine] when `CallStarted` arrives (the answer/dial tap has granted
- * RECORD_AUDIO and the app is foreground-visible — SPEC §3.1); stopped on
- * `CallEnded`. Also owns the call audio routing: communication mode while
+ * The `microphone|camera` foreground service fronting an active call. Started
+ * from [WaCallEngine] when `CallStarted` arrives (the answer/dial tap has
+ * granted RECORD_AUDIO and the app is foreground-visible — SPEC §3.1); stopped
+ * on `CallEnded`. Also owns the call audio routing: communication mode while
  * the call lives, earpiece↔speaker for the active-call screen's toggle.
+ *
+ * Both while-in-use types are declared in the manifest, but the type set
+ * passed to [startForeground] is only the granted subset: Android 14 requires
+ * the CAMERA grant *before* a startForeground claims the camera type, so the
+ * service runs microphone-only for audio-only calls and gains the camera type
+ * at start (video answer, CAMERA already granted in the answer flow) or via
+ * [elevateToCamera] (mid-call upgrade with the grant in hand).
  */
 class WaCallService : Service() {
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createChannel()
         // Bluetooth state for the call screen's toggle (permission-free;
         // idempotent process-wide singleton — started here because the tool
@@ -36,6 +47,11 @@ class WaCallService : Service() {
     companion object {
         private const val TAG = "WaCallService"
 
+        /** The live instance — [elevateToCamera] re-issues startForeground on
+         *  it while the service runs. */
+        @Volatile
+        private var instance: WaCallService? = null
+
         /** Starts the microphone FGS for an active call; returns false if
          *  Android blocked the start (background FGS restriction). */
         fun tryStart(context: Context): Boolean = try {
@@ -47,6 +63,22 @@ class WaCallService : Service() {
             Log.w(TAG, "call service start blocked: ${e.message}")
             false
         }
+
+        /** Elevates a running call FGS to the microphone|camera type set:
+         *  called by the engine the moment camera use is about to start
+         *  mid-call (the CAMERA grant is already in hand — Android 14 demands
+         *  it before a startForeground claims the camera type). A service
+         *  started after the grant (video answer) carries the camera type
+         *  from its first [onStartCommand]; no elevation needed. */
+        fun elevateToCamera(context: Context) {
+            val service = instance ?: return
+            if (!cameraGranted(context)) return
+            service.applyForegroundType()
+        }
+
+        private fun cameraGranted(context: Context): Boolean =
+            context.checkSelfPermission(Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
 
         fun tryStop(context: Context) {
             runCatching {
@@ -75,10 +107,22 @@ class WaCallService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(2, notification())
+        applyForegroundType()
         audioManager().mode = AudioManager.MODE_IN_COMMUNICATION
         holdCallLocks()
         return START_NOT_STICKY
+    }
+
+    /** startForeground with the granted while-in-use subset of the
+     *  manifest-declared types: microphone always (the call start flow gates
+     *  on RECORD_AUDIO), camera only once CAMERA is granted. Re-issuing
+     *  startForeground with the same id updates the type set. */
+    private fun applyForegroundType() {
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        if (cameraGranted(applicationContext)) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        }
+        startForeground(2, notification(), type)
     }
 
     /** CPU + wifi held for the call's lifetime (SPEC §3.1): mic capture,
@@ -104,6 +148,7 @@ class WaCallService : Service() {
     }
 
     override fun onDestroy() {
+        instance = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         wifiLock?.let { if (it.isHeld) it.release() }
