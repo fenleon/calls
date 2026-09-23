@@ -112,6 +112,22 @@ class VideoLink(
         handler = null
     }
 
+    /** Peer-driven keyframe request (`WaEvent.KeyframePressure` — a relayed
+     *  PLI/FIR): asks the encoder for a sync frame so the peer's repair
+     *  doesn't wait out the GOP. No-op when the encode half is inactive. */
+    fun requestSyncFrame() {
+        if (!running) return
+        handler?.post {
+            codec?.let { encoder ->
+                runCatching {
+                    encoder.setParameters(Bundle().apply {
+                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 1)
+                    })
+                }.onFailure { Log.w(TAG, "sync frame request failed: ${it.message}") }
+            }
+        }
+    }
+
     // --- Handler-thread side ---
 
     @android.annotation.SuppressLint("MissingPermission")

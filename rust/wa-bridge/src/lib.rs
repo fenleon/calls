@@ -1,7 +1,9 @@
 uniffi::setup_scaffolding!();
 
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use wacore::voip::rtcp::{RtcpFeedback, RTCP_PT_PSFB};
 use whatsapp_rust::prelude::wa;
 use whatsapp_rust::prelude::{Bot, BotHandle, Client, SqliteStore};
 use whatsapp_rust::types::call::{CallAction, ElsewhereOutcome, IncomingCall};
@@ -83,6 +85,12 @@ pub enum WaEvent {
     OutboundVideoDropped {
         access_units: u32,
     },
+    /// The peer demanded an outbound video keyframe (RTCP PLI/FIR on our video
+    /// stream, from `CallEvent::RtcpReceived`). The engine sheds non-IDR AUs
+    /// on its own but never signals the `VideoSource` — this lets the Kotlin
+    /// encoder answer with `PARAMETER_KEY_REQUEST_SYNC_FRAME` instead of
+    /// waiting out the GOP. Debounced to at most one event per 200 ms.
+    KeyframePressure,
 }
 
 /// One imported call-log record; maps 1:1 onto the engine's `CallLogEntry`.
@@ -104,6 +112,57 @@ pub struct WaCallRecord {
 pub struct WaContact {
     pub id: String,
     pub name: String,
+}
+
+/// Peer video keyframe demand inside one summarized RTCP compound packet: a
+/// PLI (PSFB fmt 1) or FIR (PSFB fmt 4) naming a source the packet references
+/// — `reports_video` already vouches the packet covers our outbound video.
+/// Plain receiver/sender reports carry no payload feedback and never fire.
+fn peer_video_keyframe_demand(
+    reports_video: bool,
+    feedback: &[RtcpFeedback],
+    referenced_ssrcs: &[u32],
+) -> bool {
+    if !reports_video {
+        return false;
+    }
+    feedback.iter().any(|item| {
+        if item.packet_type != RTCP_PT_PSFB {
+            return false;
+        }
+        let names_referenced = |ssrc: u32| ssrc != 0 && referenced_ssrcs.contains(&ssrc);
+        match item.fmt {
+            1 => names_referenced(item.media_ssrc),
+            4 => {
+                names_referenced(item.media_ssrc)
+                    || item.fci.chunks_exact(8).any(|row| {
+                        row.get(..4)
+                            .and_then(|head| <[u8; 4]>::try_from(head).ok())
+                            .is_some_and(|ssrc| names_referenced(u32::from_be_bytes(ssrc)))
+                    })
+            }
+            _ => false,
+        }
+    })
+}
+
+/// One-event-per-window throttle for [`WaEvent::KeyframePressure`]: a PLI
+/// storm must not spam the FFI.
+#[derive(Default)]
+struct KeyframePressureGate {
+    last: Option<Instant>,
+}
+
+impl KeyframePressureGate {
+    const WINDOW: Duration = Duration::from_millis(200);
+
+    fn admit(&mut self, now: Instant) -> bool {
+        if self.last.is_some_and(|last| now.duration_since(last) < Self::WINDOW) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
 }
 
 /// One received peer video access unit (Annex-B, start codes included).
@@ -496,6 +555,8 @@ impl CallCtx {
         let relay_upgrade = self.pending_upgrade.clone();
         self.runtime.spawn(async move {
             let call_events = relay_handle.events();
+            // Single sequential consumer: the debounce gate needs no lock.
+            let mut pressure_gate = KeyframePressureGate::default();
             while let Ok(event) = call_events.recv().await {
                 match event {
                     CallEvent::VideoStateChanged {
@@ -522,6 +583,18 @@ impl CallCtx {
                         let _ = relay_events.send(WaEvent::OutboundVideoDropped {
                             access_units: video_access_units,
                         });
+                    }
+                    CallEvent::RtcpReceived {
+                        reports_video,
+                        referenced_ssrcs,
+                        feedback,
+                        ..
+                    } if peer_video_keyframe_demand(
+                        reports_video,
+                        &feedback,
+                        &referenced_ssrcs,
+                    ) && pressure_gate.admit(Instant::now()) => {
+                        let _ = relay_events.send(WaEvent::KeyframePressure);
                     }
                     _ => {}
                 }
@@ -2523,5 +2596,102 @@ mod lid_tests {
         let jid: Jid = "243885506854938@lid".parse().unwrap();
         println!("PARSED: {:?} -> {}", jid, jid);
         assert_eq!(jid.to_string(), "243885506854938@lid");
+    }
+}
+
+#[cfg(test)]
+mod keyframe_pressure_tests {
+    use super::{KeyframePressureGate, peer_video_keyframe_demand};
+    use std::time::{Duration, Instant};
+    use wacore::voip::rtcp::{RtcpFeedback, RTCP_PT_PSFB};
+
+    const VIDEO_SSRC: u32 = 0x1234_5678;
+
+    fn psfb(fmt: u8, media_ssrc: u32, fci: Vec<u8>) -> RtcpFeedback {
+        RtcpFeedback {
+            packet_type: RTCP_PT_PSFB,
+            fmt,
+            sender_ssrc: 0xdead_beef,
+            media_ssrc,
+            fci,
+        }
+    }
+
+    #[test]
+    fn pli_on_referenced_video_ssrc_fires() {
+        assert!(peer_video_keyframe_demand(
+            true,
+            &[psfb(1, VIDEO_SSRC, vec![])],
+            &[VIDEO_SSRC],
+        ));
+    }
+
+    #[test]
+    fn pli_on_unreferenced_or_zero_ssrc_does_not_fire() {
+        // reports_video vouches the packet covers our video stream, but the
+        // PLI itself must name a source the packet references.
+        assert!(!peer_video_keyframe_demand(
+            true,
+            &[psfb(1, 0x9999, vec![])],
+            &[VIDEO_SSRC],
+        ));
+        assert!(!peer_video_keyframe_demand(
+            true,
+            &[psfb(1, 0, vec![])],
+            &[VIDEO_SSRC],
+        ));
+    }
+
+    #[test]
+    fn plain_receiver_report_does_not_fire() {
+        assert!(!peer_video_keyframe_demand(true, &[], &[VIDEO_SSRC]));
+    }
+
+    #[test]
+    fn non_payload_feedback_does_not_fire() {
+        // RTCP_PT_RTPFB (205) — e.g. NACK — is not keyframe demand.
+        let nack = RtcpFeedback {
+            packet_type: 205,
+            fmt: 1,
+            sender_ssrc: 0xdead_beef,
+            media_ssrc: VIDEO_SSRC,
+            fci: vec![],
+        };
+        assert!(!peer_video_keyframe_demand(true, &[nack], &[VIDEO_SSRC]));
+    }
+
+    #[test]
+    fn fir_without_media_ssrc_names_target_in_fci() {
+        // FIR commonly leaves the media-source field zero and names targets
+        // in 8-byte FCI rows (mirrors summarize_rtcp's parse, rtcp.rs:211).
+        let fci = VIDEO_SSRC.to_be_bytes()
+            .iter()
+            .chain(0u32.to_be_bytes().iter())
+            .copied()
+            .collect();
+        assert!(peer_video_keyframe_demand(
+            true,
+            &[psfb(4, 0, fci)],
+            &[VIDEO_SSRC],
+        ));
+    }
+
+    #[test]
+    fn no_video_in_the_packet_does_not_fire() {
+        assert!(!peer_video_keyframe_demand(
+            false,
+            &[psfb(1, VIDEO_SSRC, vec![])],
+            &[VIDEO_SSRC],
+        ));
+    }
+
+    #[test]
+    fn gate_admits_one_event_per_window() {
+        let mut gate = KeyframePressureGate::default();
+        let t0 = Instant::now();
+        assert!(gate.admit(t0));
+        assert!(!gate.admit(t0 + Duration::from_millis(199)));
+        assert!(!gate.admit(t0 + Duration::from_millis(200) - Duration::from_nanos(1)));
+        assert!(gate.admit(t0 + Duration::from_millis(200)));
     }
 }

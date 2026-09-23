@@ -2855,6 +2855,7 @@ dependencies = [
  "log",
  "tokio",
  "uniffi",
+ "wacore",
  "whatsapp-rust",
 ]
 

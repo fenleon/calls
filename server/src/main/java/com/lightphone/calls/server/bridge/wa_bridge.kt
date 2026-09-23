@@ -2922,6 +2922,16 @@ sealed class WaEvent {
         companion object
     }
     
+    /**
+     * The peer demanded an outbound video keyframe (RTCP PLI/FIR on our video
+     * stream, from `CallEvent::RtcpReceived`). The engine sheds non-IDR AUs
+     * on its own but never signals the `VideoSource` — this lets the Kotlin
+     * encoder answer with `PARAMETER_KEY_REQUEST_SYNC_FRAME` instead of
+     * waiting out the GOP. Debounced to at most one event per 200 ms.
+     */
+    object KeyframePressure : WaEvent()
+    
+    
 
     
     companion object
@@ -2974,6 +2984,7 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             14 -> WaEvent.OutboundVideoDropped(
                 FfiConverterUInt.read(buf),
                 )
+            15 -> WaEvent.KeyframePressure
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
     }
@@ -3079,6 +3090,12 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 + FfiConverterUInt.allocationSize(value.`accessUnits`)
             )
         }
+        is WaEvent.KeyframePressure -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
     }
 
     override fun write(value: WaEvent, buf: ByteBuffer) {
@@ -3153,6 +3170,10 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             is WaEvent.OutboundVideoDropped -> {
                 buf.putInt(14)
                 FfiConverterUInt.write(value.`accessUnits`, buf)
+                Unit
+            }
+            is WaEvent.KeyframePressure -> {
+                buf.putInt(15)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

@@ -504,6 +504,13 @@ object WaCallEngine : WaListener {
             is WaEvent.OutboundVideoDropped -> {
                 Log.i(TAG, "outbound video dropped: ${event.accessUnits}")
             }
+            is WaEvent.KeyframePressure -> {
+                // Peer PLI/FIR (relayed): the engine sheds non-IDR AUs on its
+                // own; the encoder can answer with a sync frame ahead of the
+                // 1 s GOP. The decode half will consume the same pressure.
+                Log.i(TAG, "keyframe pressure")
+                videoLink?.requestSyncFrame()
+            }
             else -> Unit
         }
         _events.value = event
