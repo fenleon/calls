@@ -14,6 +14,9 @@ data class CallLogEntry(
     /** Connected seconds — 0 for unanswered calls and live entries whose
      *  server record (the only duration source) hasn't landed yet. */
     val duration: Long = 0,
+    /** Accepted on another linked device: the wire omits the duration (our
+     *  device wasn't a party to the connected call). */
+    val answeredElsewhere: Boolean = false,
 )
 
 /** JSON-file call log (last 200 entries) — written by [WaCallEngine] on call
@@ -30,14 +33,59 @@ class CallLogStore(dir: File) {
     /** Bulk import (history-sync backfill): deduped on (peer, at, outgoing),
      *  re-sorted so "newest last" holds, cap enforced. A duplicate's `missed`
      *  overwrites the stored one — the corrected result (a later app-state
-     *  record for the same call) must beat what an earlier import wrote. */
+     *  record for the same call) must beat what an earlier import wrote.
+     *  Fuzzy pass: a live entry is stamped at placement/connect, the server
+     *  record at offer creation — seconds apart for the same call. Matching
+     *  within 90s collapses them onto the server record (its duration +
+     *  missed flag are authoritative) instead of duplicating the row. */
     @Synchronized
     fun addAll(entries: List<CallLogEntry>) {
         val existing = all()
-        val byKey = existing.associateByTo(LinkedHashMap()) { Triple(it.peer, it.at, it.outgoing) }
-        entries.forEach { byKey[Triple(it.peer, it.at, it.outgoing)] = it }
-        val list = byKey.values.sortedBy { it.at }.takeLast(200)
-        if (list == existing) return
+        val list = existing.toMutableList()
+        entries.forEach { entry ->
+            val exact = list.indexOfFirst {
+                it.peer == entry.peer && it.at == entry.at && it.outgoing == entry.outgoing
+            }
+            if (exact >= 0) {
+                list[exact] = entry
+                return@forEach
+            }
+            // ponytail: ±90s window; two real calls to one peer inside it merge.
+            val fuzzy = list.indexOfFirst {
+                it.peer == entry.peer && it.outgoing == entry.outgoing &&
+                    kotlin.math.abs(it.at - entry.at) <= 90_000
+            }
+            if (fuzzy >= 0) list[fuzzy] = entry else list.add(entry)
+        }
+        val newList = list.sortedBy { it.at }.takeLast(200)
+        if (newList == existing) {
+            android.util.Log.i("CallLogStore", "addAll: skip (unchanged)")
+            return
+        }
+        android.util.Log.i("CallLogStore", "addAll: n=${newList.size} wrote")
+        file.writeText(json.encodeToString(ListSerializer(CallLogEntry.serializer()), newList))
+    }
+
+    /** Fills in the live entry's connected seconds at `CallEnded` — live
+     *  entries log at placement/start with duration 0. */
+    @Synchronized
+    fun updateDuration(peer: String, at: Long, outgoing: Boolean, duration: Long) {
+        val list = all()
+        val idx = list.indexOfFirst { it.peer == peer && it.at == at && it.outgoing == outgoing }
+        if (idx < 0) return
+        val updated = list.toMutableList()
+        updated[idx] = updated[idx].copy(duration = duration)
+        file.writeText(json.encodeToString(ListSerializer(CallLogEntry.serializer()), updated))
+    }
+
+    /** Drops rows whose peer is one of the given JID user parts (self rows:
+     *  our own identity leaked in as the peer). */
+    @Synchronized
+    fun removePeers(ownUsers: Set<String>) {
+        val list = all().filter {
+            it.peer.substringBefore('@').substringBefore('.').substringBefore(':') !in ownUsers
+        }
+        if (list.size == all().size) return
         file.writeText(json.encodeToString(ListSerializer(CallLogEntry.serializer()), list))
     }
 

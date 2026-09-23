@@ -2,8 +2,8 @@ uniffi::setup_scaffolding!();
 
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
-use whatsapp_rust::prelude::{Bot, BotHandle, Client, SqliteStore};
 use whatsapp_rust::prelude::wa;
+use whatsapp_rust::prelude::{Bot, BotHandle, Client, SqliteStore};
 use whatsapp_rust::types::call::{CallAction, ElsewhereOutcome, IncomingCall};
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::voip::CallHandle;
@@ -16,11 +16,15 @@ use whatsapp_rust::{async_channel as chan, Jid};
 #[derive(uniffi::Enum)]
 pub enum WaEvent {
     NeedPairing,
-    PairingQr { payload: String },
+    PairingQr {
+        payload: String,
+    },
     /// `fresh` distinguishes a real pairing (`PairSuccess`) from a mere
     /// transport connect of an existing session (`Connected`) — only the
     /// former resets the surface's respawn cap.
-    Paired { fresh: bool },
+    Paired {
+        fresh: bool,
+    },
     /// The server revoked this device's link (logged out from the primary).
     /// The stored registration is dead and reconnecting with it loops
     /// forever — the surface wipes the session store and restarts.
@@ -28,19 +32,39 @@ pub enum WaEvent {
     /// The bot's run loop died (crash / unrecoverable disconnect) while the
     /// session was still valid: respawn without wiping the store.
     Disconnected,
-    IncomingCall { peer: String, is_video: bool },
+    IncomingCall {
+        peer: String,
+        is_video: bool,
+    },
     /// An outgoing call is ringing — the offer is out, the peer has not
     /// answered yet. `peer` is the display string (`place_call` input).
-    Ringing { peer: String },
-    CallStarted { call_id: String },
-    CallEnded { reason: String },
-    MissedCall { peer: String },
+    Ringing {
+        peer: String,
+    },
+    CallStarted {
+        call_id: String,
+    },
+    CallEnded {
+        reason: String,
+    },
+    MissedCall {
+        peer: String,
+    },
     /// Call-log backfill from the pairing history sync
     /// (`HistorySync.callLogRecords`) — the same history web.whatsapp shows.
-    CallLogImport { entries: Vec<WaCallRecord> },
-    /// Names + numbers of everyone the account has interacted with
-    /// (history-sync pushnames + conversation JIDs). Never message content.
-    ContactsImport { contacts: Vec<WaContact> },
+    CallLogImport {
+        entries: Vec<WaCallRecord>,
+    },
+    /// Names + numbers of people the account has 1:1 history with.
+    /// `replace`: the pairing history-sync's authoritative peer set — swaps
+    /// the whole list (purges stale entries). `renameOnly`: push-name
+    /// updates — only rename contacts already in the list (pushnames alone
+    /// never add a peer: they cover every group participant).
+    ContactsImport {
+        contacts: Vec<WaContact>,
+        replace: bool,
+        rename_only: bool,
+    },
 }
 
 /// One imported call-log record; maps 1:1 onto the engine's `CallLogEntry`.
@@ -51,6 +75,8 @@ pub struct WaCallRecord {
     pub at: u64,
     pub outgoing: bool,
     pub missed: bool,
+    /// Accepted on another linked device — no wire duration exists.
+    pub answered_elsewhere: bool,
     /// Connected duration in seconds (0 for unanswered calls).
     pub duration: u64,
 }
@@ -150,9 +176,10 @@ fn install_panic_hook() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let msg = format!("wa-bridge panic: {payload} at {location}");
-        if let (Ok(tag), Ok(text)) =
-            (CString::new("wa-bridge"), CString::new(msg.replace('\0', " ")))
-        {
+        if let (Ok(tag), Ok(text)) = (
+            CString::new("wa-bridge"),
+            CString::new(msg.replace('\0', " ")),
+        ) {
             unsafe {
                 android_log_sys::__android_log_write(
                     android_log_sys::LogPriority::ERROR as android_log_sys::c_int,
@@ -250,6 +277,13 @@ pub struct WaBridge {
     /// cleared by a terminate so a timed-out ring can never be answered by a
     /// stale stanza.
     outgoing_ringing: OutgoingRinging,
+    /// The 1:1 conversation peers seen in history-sync blobs (JID → unused)
+    /// — the authoritative contact set. The blobs' pushname list covers every
+    /// group participant, so it only ever names these peers, never adds.
+    history_peers: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Push names from history-sync blobs, kept separately because they
+    /// typically arrive in later chunks than the conversations they name.
+    history_pushnames: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl WaBridge {
@@ -278,8 +312,9 @@ impl WaBridge {
         } else {
             format!("{s}@s.whatsapp.net")
         };
-        raw.parse()
-            .map_err(|_| WaError::Protocol { msg: "invalid phone number or JID".to_string() })
+        raw.parse().map_err(|_| WaError::Protocol {
+            msg: "invalid phone number or JID".to_string(),
+        })
     }
 
     /// Cloned shared state for a call-control body running on the tokio
@@ -327,9 +362,9 @@ struct CallCtx {
 /// never unwind by design) — surfaced as a protocol error so Kotlin gets a
 /// rejection instead of a lost future.
 async fn join<T>(spawned: tokio::task::JoinHandle<Result<T, WaError>>) -> Result<T, WaError> {
-    spawned
-        .await
-        .map_err(|_| WaError::Protocol { msg: "bridge task panicked".to_string() })?
+    spawned.await.map_err(|_| WaError::Protocol {
+        msg: "bridge task panicked".to_string(),
+    })?
 }
 
 impl CallCtx {
@@ -363,7 +398,10 @@ impl CallCtx {
             // Only clear OUR entry — a new call may have attached already.
             {
                 let mut slot = call_slot.lock().unwrap();
-                if slot.as_ref().is_some_and(|h| h.call_id() == watcher_call_id) {
+                if slot
+                    .as_ref()
+                    .is_some_and(|h| h.call_id() == watcher_call_id)
+                {
                     *slot = None;
                 }
             }
@@ -407,6 +445,8 @@ impl WaBridge {
             ended_emitted: Arc::new(Mutex::new(None)),
             incoming: Arc::new(Mutex::new(None)),
             outgoing_ringing: Arc::new(Mutex::new(None)),
+            history_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            history_pushnames: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -427,16 +467,14 @@ impl WaBridge {
     /// and spawns a fresh one on the same session store — a new pairing flow
     /// with fresh QRs. Kotlin calls this when the user taps connect.
     pub fn restart_pairing(&self) -> Result<(), WaError> {
-        let db_path = self
-            .db_path
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        let db_path = self.db_path.lock().unwrap().clone().ok_or(WaError::Io {
+            msg: "not started".to_string(),
+        })?;
         // Dropping the handle aborts the old run loop; the pairing flow has
         // no state worth a graceful shutdown.
         let _ = self.handle.lock().unwrap().take();
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.account.lock().unwrap() = None;
         self.spawn_bot(&db_path)
     }
@@ -446,14 +484,12 @@ impl WaBridge {
     /// the bot AND wipe the session store so the respawn registers as a
     /// brand-new device (fresh QRs, fresh device identity).
     pub fn reset_session(&self) -> Result<(), WaError> {
-        let db_path = self
-            .db_path
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        let db_path = self.db_path.lock().unwrap().clone().ok_or(WaError::Io {
+            msg: "not started".to_string(),
+        })?;
         let _ = self.handle.lock().unwrap().take();
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.account.lock().unwrap() = None;
         if let Some(dir) = db_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
@@ -470,14 +506,12 @@ impl WaBridge {
     /// fires is suppressed (`unlinking`): the caller parked the UI on
     /// `NeedPairing` and owns the teardown.
     pub fn logout(&self) -> Result<(), WaError> {
-        let db_path = self
-            .db_path
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(WaError::Io { msg: "not started".to_string() })?;
+        let db_path = self.db_path.lock().unwrap().clone().ok_or(WaError::Io {
+            msg: "not started".to_string(),
+        })?;
         let handle = self.handle.lock().unwrap().take();
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.account.lock().unwrap() = None;
         self.unlinking
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -525,6 +559,8 @@ impl WaBridge {
         let incoming = self.incoming.clone();
         let ended_emitted = self.ended_emitted.clone();
         let outgoing_ringing = self.outgoing_ringing.clone();
+        let history_peers = self.history_peers.clone();
+        let history_pushnames = self.history_pushnames.clone();
         let handle: BotHandle = runtime.block_on(async move {
             let store = SqliteStore::new(&db_path.to_string_lossy())
                 .await
@@ -560,6 +596,8 @@ impl WaBridge {
                     let incoming = incoming.clone();
                     let ended_emitted = ended_emitted.clone();
                     let outgoing_ringing = outgoing_ringing.clone();
+                    let history_peers = history_peers.clone();
+                    let history_pushnames = history_pushnames.clone();
                     async move {
                         // PairSuccess carries the freshly paired account; the
                         // restored-session case reads it off the client below
@@ -589,7 +627,9 @@ impl WaBridge {
                         // never be answered by a stale stanza.
                         if let Event::IncomingCall(call) = &*event {
                             match &call.action {
-                                CallAction::Offer { group_jid: None, .. } => {
+                                CallAction::Offer {
+                                    group_jid: None, ..
+                                } => {
                                     *incoming.lock().unwrap() = Some(call.clone());
                                 }
                                 CallAction::Accept { call_id, .. } => {
@@ -599,7 +639,11 @@ impl WaBridge {
                                         });
                                     }
                                 }
-                                CallAction::Terminate { call_id, call_creator, .. } => {
+                                CallAction::Terminate {
+                                    call_id,
+                                    call_creator,
+                                    ..
+                                } => {
                                     *incoming.lock().unwrap() = None;
                                     clear_outgoing_ringing(
                                         &outgoing_ringing,
@@ -643,6 +687,8 @@ impl WaBridge {
                                             id: record.peer,
                                             name: String::new(),
                                         }],
+                                        replace: false,
+                                        rename_only: false,
                                     });
                                 }
                             }
@@ -657,6 +703,8 @@ impl WaBridge {
                                         id,
                                         name: name.to_string(),
                                     }],
+                                    replace: false,
+                                    rename_only: true,
                                 });
                             }
                             return;
@@ -690,6 +738,8 @@ impl WaBridge {
                                 let id = resolve_jid(&client, jid).await;
                                 let _ = tx.send(WaEvent::ContactsImport {
                                     contacts: vec![WaContact { id, name }],
+                                    replace: false,
+                                    rename_only: false,
                                 });
                             }
                             return;
@@ -709,7 +759,13 @@ impl WaBridge {
                                 if let Some(lid) = client.lid() {
                                     own.push(lid.to_string());
                                 }
-                                import_history(&own, parsed, &tx);
+                                import_history(
+                                    &own,
+                                    parsed,
+                                    &tx,
+                                    &history_peers,
+                                    &history_pushnames,
+                                );
                             }
                             return;
                         }
@@ -727,6 +783,36 @@ impl WaBridge {
                             // call id on CallEnded, and the call log would
                             // double-write).
                             if gate_end(&ended_emitted, &event, &mapped) {
+                                // Ring self-expiry: companion devices don't
+                                // reliably receive the caller's terminate for an
+                                // unanswered call (observed 2026-09-23: a
+                                // primary-sent terminate reaches us, a companion
+                                // caller's doesn't), so the ring expires past the
+                                // native caller no-answer window instead of
+                                // ringing forever. A terminate/accept/reject that
+                                // landed first cleared the slot; the call-id
+                                // guard drops a stale timer's claim on a newer
+                                // ring.
+                                if let (
+                                    Event::IncomingCall(call),
+                                    WaEvent::IncomingCall { peer, .. },
+                                ) = (event.as_ref(), &mapped)
+                                {
+                                    if matches!(
+                                        call.action,
+                                        CallAction::Offer {
+                                            group_jid: None,
+                                            ..
+                                        }
+                                    ) {
+                                        arm_ring_timeout(
+                                            &tx,
+                                            &incoming,
+                                            call.action.call_id(),
+                                            peer.clone(),
+                                        );
+                                    }
+                                }
                                 let _ = tx.send(mapped);
                             }
                         }
@@ -803,24 +889,44 @@ impl WaBridge {
     /// that resolved — the engine rewrites its stores onto the phone JID, the
     /// identity that is stable across ingest paths (history-sync blob, live
     /// events), collapsing the duplicates the two paths produced.
+    /// The linked account's own JID strings (PN + LID) — the caller purges
+    /// self-rows from its stores (own calls leaked in as peers).
+    pub fn own_jids(&self) -> Vec<String> {
+        self.client().map(|c| own_jids(&c)).unwrap_or_default()
+    }
+
     pub async fn resolve_lids(&self, lids: Vec<String>) -> Result<Vec<WaLidMapping>, WaError> {
         let client = self.client()?;
-        let mut out = Vec::new();
-        for lid in lids {
-            let Ok(jid) = lid.parse::<Jid>() else {
-                continue;
-            };
-            if !jid.is_lid() {
-                continue;
+        let runtime = self
+            .runtime
+            .get()
+            .ok_or(WaError::NotPaired)?
+            .handle()
+            .clone();
+        // uniffi polls this body on the caller's plain thread, but the store's
+        // lookups `spawn_blocking` — a runtime-less panic (seen on every
+        // bridge start, silently killing the identity heal). Route through
+        // our runtime: the same spawn + join pattern as the call-control
+        // bodies.
+        join(runtime.spawn(async move {
+            let mut out = Vec::new();
+            for lid in lids {
+                let Ok(jid) = lid.parse::<Jid>() else {
+                    continue;
+                };
+                if !jid.is_lid() {
+                    continue;
+                }
+                if let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await {
+                    out.push(WaLidMapping {
+                        lid: jid.to_string(),
+                        pn: format!("{}@s.whatsapp.net", entry.phone_number),
+                    });
+                }
             }
-            if let Ok(Some(entry)) = client.get_lid_pn_entry(&jid).await {
-                out.push(WaLidMapping {
-                    lid: jid.to_string(),
-                    pn: format!("{}@s.whatsapp.net", entry.phone_number),
-                });
-            }
-        }
-        Ok(out)
+            Ok(out)
+        }))
+        .await
     }
 
     /// Places a 1:1 call. `phone_or_jid` is a bare phone number (an E.164
@@ -837,7 +943,9 @@ impl WaBridge {
             // Glare guard: a second concurrent call would orphan the first
             // one's audio channels and its end reporting.
             if ctx.call.lock().unwrap().is_some() {
-                return Err(WaError::Protocol { msg: "a call is already active".to_string() });
+                return Err(WaError::Protocol {
+                    msg: "a call is already active".to_string(),
+                });
             }
             let jid = Self::parse_jid(&phone_or_jid)?;
             let (mic, playout) = ctx.audio_endpoints();
@@ -847,13 +955,7 @@ impl WaBridge {
             // than dropped — `settle_outgoing_ring` reports whichever state
             // the call is actually in once `start()` returns.
             *ctx.outgoing_ringing.lock().unwrap() = Some(OutgoingRing::Pending);
-            let handle = match client
-                .voip()
-                .call(&jid)
-                .audio(mic, playout)
-                .start()
-                .await
-            {
+            let handle = match client.voip().call(&jid).audio(mic, playout).start().await {
                 Ok(handle) => handle,
                 Err(e) => {
                     // No call came up: a stale mark must never answer.
@@ -871,7 +973,9 @@ impl WaBridge {
             let _ = ctx.events.send(if early_answer {
                 // The accept landed during the offer send: the call is
                 // connected — never report a stale "Ringing".
-                WaEvent::CallStarted { call_id: call_id.clone() }
+                WaEvent::CallStarted {
+                    call_id: call_id.clone(),
+                }
             } else {
                 WaEvent::Ringing { peer: phone_or_jid }
             });
@@ -997,8 +1101,8 @@ impl WaBridge {
     /// playout thread, polling with a 5 ms sleep. An empty Vec means the
     /// engine starved us within `timeout_ms` — play silence for that frame.
     pub fn recv_playout_pcm(&self, timeout_ms: u32) -> Vec<i16> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(u64::from(timeout_ms));
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
         loop {
             match self.playout_rx.try_recv() {
                 Ok(frame) => return frame,
@@ -1148,10 +1252,25 @@ fn gate_end(ended: &EndedEmitted, source: &Event, mapped: &WaEvent) -> bool {
 /// offer's own `IncomingCall` event (stale incoming-call UI).
 async fn peer_display_for(client: &Client, event: &Event) -> Option<String> {
     match event {
-        Event::IncomingCall(call) if matches!(call.action, CallAction::Offer { group_jid: None, .. }) => {
+        Event::IncomingCall(call)
+            if matches!(
+                call.action,
+                CallAction::Offer {
+                    group_jid: None,
+                    ..
+                }
+            ) =>
+        {
             match offer_caller_pn_display(&call.action) {
                 Some(pn) => Some(pn),
-                None if call.from.is_lid() => Some(resolve_lid_display(client, &call.from).await),
+                None if call.from.is_lid() => {
+                    // Query the bare user LID: a device-suffixed Jid fails the
+                    // usync lookup and the raw fallback leaks the `:device`
+                    // suffix into the call-log display.
+                    let mut bare = call.from.clone();
+                    bare.device = 0;
+                    Some(resolve_lid_display(client, &bare).await)
+                }
                 None => None,
             }
         }
@@ -1181,6 +1300,11 @@ fn offer_caller_pn_display(action: &CallAction) -> Option<String> {
 /// LID, timeout — falls back to the raw JID. Never invents a number.
 async fn resolve_lid_display(client: &Client, lid: &Jid) -> String {
     let raw = lid.to_string();
+    // The local history-sync LID→PN mapping answers offline; the usync query
+    // is only the fallback (it can time out or be privacy-refused).
+    if let Ok(Some(entry)) = client.get_lid_pn_entry(lid).await {
+        return format!("{}@s.whatsapp.net", entry.phone_number);
+    }
     let contacts = client.contacts();
     let query = contacts.is_on_whatsapp(std::slice::from_ref(lid));
     match tokio::time::timeout(std::time::Duration::from_secs(5), query).await {
@@ -1191,6 +1315,34 @@ async fn resolve_lid_display(client: &Client, lid: &Jid) -> String {
             .unwrap_or(raw),
         Ok(Err(_)) | Err(_) => raw,
     }
+}
+
+/// Arms the callee-side ring expiry for a 1:1 offer: after the native caller
+/// no-answer window the slot is cleared (if still this call) and a
+/// `MissedCall` is emitted with the same resolved peer the panel was opened
+/// with, so the incoming screen closes and the log writes the missed row.
+fn arm_ring_timeout(
+    tx: &mpsc::Sender<WaEvent>,
+    incoming: &Arc<Mutex<Option<IncomingCall>>>,
+    ring_call_id: &str,
+    peer: String,
+) {
+    let ring_call_id = ring_call_id.to_string();
+    let tx = tx.clone();
+    let incoming = incoming.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        let expired = incoming
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|c| c.action.call_id() == ring_call_id);
+        if expired {
+            *incoming.lock().unwrap() = None;
+            log::info!("voip: ring timed out, missed");
+            let _ = tx.send(WaEvent::MissedCall { peer });
+        }
+    });
 }
 
 /// Bot → `WaEvent` mapping (first pass; Task 5 extends with call control).
@@ -1224,9 +1376,7 @@ fn map_event(event: &Event, resolved_peer: Option<&str>) -> Option<WaEvent> {
             // never answered (the peer gave up — a missed call, but the
             // dedicated MissedCall event covers the offline-replay case).
             CallAction::Terminate { reason, .. } => Some(WaEvent::CallEnded {
-                reason: reason
-                    .clone()
-                    .unwrap_or_else(|| "ended".to_string()),
+                reason: reason.clone().unwrap_or_else(|| "ended".to_string()),
             }),
             _ => None,
         },
@@ -1260,9 +1410,12 @@ fn own_jids(client: &Client) -> Vec<String> {
 /// True for a 1:1 regular call record — group calls and call links are out
 /// of scope (SPEC). An absent call_type is the proto default = REGULAR.
 fn one_to_one_record(r: &wa::CallLogRecord) -> bool {
-    !r.call_type
-        .is_some_and(|t| !matches!(t, whatsapp_rust::waproto::whatsapp::call_log_record::CallType::REGULAR))
-        && r.group_jid.is_none()
+    !r.call_type.is_some_and(|t| {
+        !matches!(
+            t,
+            whatsapp_rust::waproto::whatsapp::call_log_record::CallType::REGULAR
+        )
+    }) && r.group_jid.is_none()
         && !r.is_call_link.unwrap_or(false)
 }
 
@@ -1276,7 +1429,22 @@ fn record_peer_jid(r: &wa::CallLogRecord, own: &[String]) -> Option<String> {
     };
     let mut candidates = candidate.into_iter().collect::<Vec<_>>();
     candidates.extend(r.participants.iter().filter_map(|p| p.user_jid.clone()));
-    candidates.into_iter().find(|j| !own.contains(j))
+    candidates.into_iter().find(|j| !is_own_jid(j, own))
+}
+
+/// Identity-only own check: user + server, ignoring device/agent components.
+/// An exact string match missed our own participant in its other wire form
+/// (bare LID vs `:device`-suffixed), so our own calls logged us as the peer
+/// (feedback 2026-09-23: duplicate "FENN"/"+13083225387035" rows).
+fn is_own_jid(candidate: &str, own: &[String]) -> bool {
+    let Ok(c) = candidate.parse::<Jid>() else {
+        return false;
+    };
+    own.iter().any(|o| {
+        o.parse::<Jid>()
+            .map(|o| o.user == c.user && o.server == c.server)
+            .unwrap_or(false)
+    })
 }
 
 fn call_record_to_wa(r: &wa::CallLogRecord, peer: String) -> Option<WaCallRecord> {
@@ -1294,6 +1462,9 @@ fn call_record_to_wa(r: &wa::CallLogRecord, peer: String) -> Option<WaCallRecord
             r.call_result,
             None | Some(CallResult::CONNECTED) | Some(CallResult::ACCEPTEDELSEWHERE)
         ),
+        // Accepted on another linked device: the wire omits `duration` for
+        // these — our device wasn't a party to the connected call.
+        answered_elsewhere: matches!(r.call_result, Some(CallResult::ACCEPTEDELSEWHERE)),
         duration: r.duration.unwrap_or(0).max(0) as u64,
     })
 }
@@ -1301,7 +1472,9 @@ fn call_record_to_wa(r: &wa::CallLogRecord, peer: String) -> Option<WaCallRecord
 /// LID → phone JID through the client's local mapping cache (no network);
 /// anything that isn't a LID passes through unchanged.
 async fn resolve_jid(client: &Client, jid: String) -> String {
-    let Ok(parsed) = jid.parse::<Jid>() else { return jid };
+    let Ok(parsed) = jid.parse::<Jid>() else {
+        return jid;
+    };
     if !parsed.is_lid() {
         return jid;
     }
@@ -1315,10 +1488,16 @@ async fn resolve_jid(client: &Client, jid: String) -> String {
 /// and emits them as import events. `own` lists our own JID strings so a
 /// record's participant list can drop us (outgoing calls list us as creator).
 /// Only peer JIDs, names, and call metadata leave the blob — never messages.
+/// Contacts accumulate across the pairing blobs in `peers`/`pushnames`
+/// (conversations typically land in an earlier chunk than the pushnames that
+/// name them); every blob emits the full accumulated set with `replace: true`
+/// so the stored list always equals the 1:1 conversation set.
 fn import_history(
     own: &[String],
     hs: &whatsapp_rust::waproto::whatsapp::HistorySync,
     tx: &mpsc::Sender<WaEvent>,
+    peers: &Mutex<std::collections::HashMap<String, String>>,
+    pushnames: &Mutex<std::collections::HashMap<String, String>>,
 ) {
     // LID → phone JID: real numbers beat bare LIDs in the log.
     let pn_of: std::collections::HashMap<&str, &str> = hs
@@ -1327,7 +1506,10 @@ fn import_history(
         .filter_map(|m| Some((m.lid_jid.as_deref()?, m.pn_jid.as_deref()?)))
         .collect();
     let resolve = |jid: String| -> String {
-        pn_of.get(jid.as_str()).map(|pn| (*pn).to_string()).unwrap_or(jid)
+        pn_of
+            .get(jid.as_str())
+            .map(|pn| (*pn).to_string())
+            .unwrap_or(jid)
     };
 
     let entries: Vec<WaCallRecord> = hs
@@ -1343,28 +1525,47 @@ fn import_history(
         let _ = tx.send(WaEvent::CallLogImport { entries });
     }
 
-    // Contacts: pushnames carry the name, conversations carry the peer set.
-    // 1:1 JIDs only — groups and broadcast lists stay out.
-    let mut contacts: Vec<WaContact> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut push = |id: String, name: String, seen: &mut std::collections::HashSet<String>| {
-        if !id.contains('@') || id.starts_with("0@") || id.ends_with("@g.us") || id.starts_with("status@") || id.ends_with("@broadcast") {
-            return;
-        }
-        if seen.insert(id.clone()) {
-            contacts.push(WaContact { id: resolve(id), name });
-        }
+    // Contacts: 1:1 conversation peers only. The blob's pushname list covers
+    // every group participant, so it only ever NAMES a peer — never adds one.
+    let is_peer = |id: &str| {
+        id.contains('@')
+            && !id.starts_with("0@")
+            && !id.ends_with("@g.us")
+            && !id.starts_with("status@")
+            && !id.ends_with("@broadcast")
     };
-    for p in &hs.pushnames {
-        if let (Some(id), Some(name)) = (p.id.as_ref(), p.pushname.as_ref()) {
-            push(id.clone(), name.clone(), &mut seen);
+    {
+        let mut pn = pushnames.lock().unwrap();
+        for p in &hs.pushnames {
+            if let (Some(id), Some(name)) = (p.id.as_ref(), p.pushname.as_ref()) {
+                if is_peer(id) {
+                    pn.insert(id.clone(), name.clone());
+                }
+            }
         }
     }
-    for c in &hs.conversations {
-        push(c.id.clone(), String::new(), &mut seen);
-    }
-    if !contacts.is_empty() {
-        let _ = tx.send(WaEvent::ContactsImport { contacts });
+    {
+        let mut set = peers.lock().unwrap();
+        for c in &hs.conversations {
+            let id = &c.id;
+            if is_peer(id) {
+                set.entry(id.clone()).or_default();
+            }
+        }
+        let contacts: Vec<WaContact> = {
+            let pn = pushnames.lock().unwrap();
+            set.keys()
+                .map(|id| WaContact {
+                    id: resolve(id.clone()),
+                    name: pn.get(id).cloned().unwrap_or_default(),
+                })
+                .collect()
+        };
+        let _ = tx.send(WaEvent::ContactsImport {
+            contacts,
+            replace: true,
+            rename_only: false,
+        });
     }
 }
 
@@ -1444,10 +1645,18 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            pushnames: vec![Pushname {
-                id: Some("4915112345678@s.whatsapp.net".into()),
-                pushname: Some("Fenn".into()),
-            }],
+            pushnames: vec![
+                Pushname {
+                    id: Some("4915112345678@s.whatsapp.net".into()),
+                    pushname: Some("Fenn".into()),
+                },
+                // A group participant we never had a 1:1 chat with — the
+                // pushname alone must not enter the contact list.
+                Pushname {
+                    id: Some("4915199988877@s.whatsapp.net".into()),
+                    pushname: Some("Stranger".into()),
+                },
+            ],
             conversations: vec![
                 Conversation {
                     id: "4915112345678@s.whatsapp.net".into(),
@@ -1461,14 +1670,22 @@ mod tests {
             ..Default::default()
         };
         let own = ["15551234567@s.whatsapp.net".to_string()];
-        import_history(&own, &hs, &tx);
+        import_history(
+            &own,
+            &hs,
+            &tx,
+            &Mutex::new(std::collections::HashMap::new()),
+            &Mutex::new(std::collections::HashMap::new()),
+        );
         drop(tx);
         let got: Vec<WaEvent> = rx.iter().collect();
-        let log = got.iter().find_map(|e| match e {
-            WaEvent::CallLogImport { entries } => Some(entries.clone()),
-            _ => None,
-        })
-        .expect("call log import emitted");
+        let log = got
+            .iter()
+            .find_map(|e| match e {
+                WaEvent::CallLogImport { entries } => Some(entries.clone()),
+                _ => None,
+            })
+            .expect("call log import emitted");
         assert_eq!(log.len(), 3);
         assert_eq!(log[0].peer, "15550000000@s.whatsapp.net"); // LID resolved to PN
         assert_eq!(log[0].at, 1_700_000_000_000);
@@ -1478,11 +1695,13 @@ mod tests {
         assert!(!log[1].missed);
         assert_eq!(log[2].peer, "4915112345678@s.whatsapp.net"); // us dropped from participants
         assert!(log[2].outgoing && log[2].missed);
-        let contacts = got.iter().find_map(|e| match e {
-            WaEvent::ContactsImport { contacts } => Some(contacts.clone()),
-            _ => None,
-        })
-        .expect("contacts import emitted");
+        let contacts = got
+            .iter()
+            .find_map(|e| match e {
+                WaEvent::ContactsImport { contacts, .. } => Some(contacts.clone()),
+                _ => None,
+            })
+            .expect("contacts import emitted");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].id, "4915112345678@s.whatsapp.net");
         assert_eq!(contacts[0].name, "Fenn");
@@ -1562,11 +1781,9 @@ mod tests {
             Ok(())
         };
         // Uniffi's poll thread: plain, non-tokio.
-        let got = std::thread::spawn(move || {
-            futures::executor::block_on(join(handle.spawn(body)))
-        })
-        .join()
-        .expect("poll thread must not panic");
+        let got = std::thread::spawn(move || futures::executor::block_on(join(handle.spawn(body))))
+            .join()
+            .expect("poll thread must not panic");
         got.expect("body result");
     }
 
@@ -1643,9 +1860,15 @@ mod tests {
         ));
         let mapped = map_event(&missed, None).expect("MissedCall maps");
         assert!(matches!(&mapped, WaEvent::MissedCall { .. }));
-        assert!(gate_end(&ended, &missed, &mapped), "MissedCall is never gated");
+        assert!(
+            gate_end(&ended, &missed, &mapped),
+            "MissedCall is never gated"
+        );
         let mapped = map_event(&terminate("CALL-3"), None).expect("Terminate maps to CallEnded");
-        assert!(gate_end(&ended, &terminate("CALL-3"), &mapped), "different call id claims its own end");
+        assert!(
+            gate_end(&ended, &terminate("CALL-3"), &mapped),
+            "different call id claims its own end"
+        );
     }
 
     /// F1: the ringing→answered transition. The peer's `<accept>` claims the
@@ -1657,19 +1880,34 @@ mod tests {
         let ringing: OutgoingRinging = Arc::default();
         *ringing.lock().unwrap() = Some(OutgoingRing::Ringing("CALL-1".to_string()));
 
-        assert!(claim_outgoing_answer(&ringing, "CALL-1"), "the answer claims the ring");
-        assert!(!claim_outgoing_answer(&ringing, "CALL-1"), "duplicate accept is dropped");
-        assert!(!claim_outgoing_answer(&ringing, "CALL-2"), "a foreign call id never claims");
+        assert!(
+            claim_outgoing_answer(&ringing, "CALL-1"),
+            "the answer claims the ring"
+        );
+        assert!(
+            !claim_outgoing_answer(&ringing, "CALL-1"),
+            "duplicate accept is dropped"
+        );
+        assert!(
+            !claim_outgoing_answer(&ringing, "CALL-2"),
+            "a foreign call id never claims"
+        );
 
         // Ring timeout: the terminate clears the mark, a late accept is inert.
         *ringing.lock().unwrap() = Some(OutgoingRing::Ringing("CALL-3".to_string()));
         clear_outgoing_ringing(&ringing, "CALL-3", None, None);
-        assert!(!claim_outgoing_answer(&ringing, "CALL-3"), "no answer after the ring ended");
+        assert!(
+            !claim_outgoing_answer(&ringing, "CALL-3"),
+            "no answer after the ring ended"
+        );
 
         // A terminate for a different call id leaves the ring untouched.
         *ringing.lock().unwrap() = Some(OutgoingRing::Ringing("CALL-4".to_string()));
         clear_outgoing_ringing(&ringing, "CALL-9", None, None);
-        assert!(claim_outgoing_answer(&ringing, "CALL-4"), "unrelated terminate must not clear");
+        assert!(
+            claim_outgoing_answer(&ringing, "CALL-4"),
+            "unrelated terminate must not clear"
+        );
     }
 
     /// F1: an accept landing in the offer-send window (the mark is still
@@ -1691,7 +1929,10 @@ mod tests {
             settle_outgoing_ring(&ringing, "CALL-1"),
             "place_call confirms the stashed id and reports the start",
         );
-        assert!(ringing.lock().unwrap().is_none(), "the answered mark is consumed");
+        assert!(
+            ringing.lock().unwrap().is_none(),
+            "the answered mark is consumed"
+        );
 
         // A foreign early accept: the stash mismatches, the ring re-arms so
         // the real answer can still claim it.
@@ -1724,7 +1965,10 @@ mod tests {
             "a foreign terminate leaves the pending mark",
         );
         clear_outgoing_ringing(&ringing, "CALL-1", Some(&own), Some(&own));
-        assert!(ringing.lock().unwrap().is_none(), "our own terminate drops it");
+        assert!(
+            ringing.lock().unwrap().is_none(),
+            "our own terminate drops it"
+        );
     }
 
     /// F2: the offer's server-provided `caller_pn` is the display string for
@@ -1734,25 +1978,27 @@ mod tests {
     fn peer_display_prefers_caller_pn_and_resolved_string() {
         let caller: Jid = "13083225387035@lid".parse().expect("lid jid");
         let pn: Jid = "15551234567@s.whatsapp.net".parse().expect("pn jid");
-        let offer = |caller_pn: Option<Jid>, group_jid: Option<Jid>| {
-            CallAction::Offer {
-                call_id: "CALL-1".to_string(),
-                call_creator: caller.clone(),
-                caller_pn,
-                caller_country_code: None,
-                device_class: None,
-                joinable: false,
-                is_video: false,
-                audio: Vec::new(),
-                group_jid,
-            }
+        let offer = |caller_pn: Option<Jid>, group_jid: Option<Jid>| CallAction::Offer {
+            call_id: "CALL-1".to_string(),
+            call_creator: caller.clone(),
+            caller_pn,
+            caller_country_code: None,
+            device_class: None,
+            joinable: false,
+            is_video: false,
+            audio: Vec::new(),
+            group_jid,
         };
 
         assert_eq!(
             offer_caller_pn_display(&offer(Some(pn.clone()), None)).as_deref(),
             Some("15551234567@s.whatsapp.net"),
         );
-        assert_eq!(offer_caller_pn_display(&offer(None, None)), None, "no attribute, no claim");
+        assert_eq!(
+            offer_caller_pn_display(&offer(None, None)),
+            None,
+            "no attribute, no claim"
+        );
         assert_eq!(
             offer_caller_pn_display(&offer(Some(pn.clone()), Some(caller.clone()))),
             None,
@@ -1770,10 +2016,24 @@ mod tests {
         };
         // The resolved string replaces the raw LID; without one the raw
         // JID stays (never a fabricated number).
-        let mapped = map_event(&incoming(offer(None, None)), Some("15551234567"))
-            .expect("1:1 offer maps");
+        let mapped =
+            map_event(&incoming(offer(None, None)), Some("15551234567")).expect("1:1 offer maps");
         assert!(matches!(&mapped, WaEvent::IncomingCall { peer, .. } if peer == "15551234567"));
         let mapped = map_event(&incoming(offer(None, None)), None).expect("1:1 offer maps");
-        assert!(matches!(&mapped, WaEvent::IncomingCall { peer, .. } if peer == "13083225387035@lid"));
+        assert!(
+            matches!(&mapped, WaEvent::IncomingCall { peer, .. } if peer == "13083225387035@lid")
+        );
+    }
+}
+
+#[cfg(test)]
+mod lid_tests {
+    use whatsapp_rust::Jid;
+
+    #[test]
+    fn lid_roundtrip() {
+        let jid: Jid = "243885506854938@lid".parse().unwrap();
+        println!("PARSED: {:?} -> {}", jid, jid);
+        assert_eq!(jid.to_string(), "243885506854938@lid");
     }
 }

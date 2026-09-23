@@ -57,6 +57,16 @@ object WaCallEngine : WaListener {
     @Volatile
     private var currentCallStarted = false
 
+    /** The `at` stamp of the live call's log entry (placement for outgoing,
+     *  connect for incoming) — the key the `CallEnded` duration update. */
+    @Volatile
+    private var currentCallLogAt = 0L
+
+    /** Connect epoch (CallStarted) — `CallEnded` computes the log entry's
+     *  connected seconds from it; 0 when the call never connected. */
+    @Volatile
+    private var currentCallConnectedAt = 0L
+
     /** Resolved display peer of the currently ringing incoming offer —
      *  survives the offer's not-started `CallEnded` so a following
      *  `MissedCall` (which carries the caller's raw LID) still logs the
@@ -77,6 +87,8 @@ object WaCallEngine : WaListener {
         currentCallPeer = null
         currentCallOutgoing = false
         currentCallStarted = false
+        currentCallConnectedAt = 0
+        currentCallLogAt = 0
         activeScreenRouted = false
     }
 
@@ -86,6 +98,7 @@ object WaCallEngine : WaListener {
             if (bridge != null) return
             val app = context.applicationContext
             appContext = app
+            Log.i(TAG, "attach: dir=${app.filesDir}")
             callLog = CallLogStore(app.filesDir)
             contacts = ContactStore(app.filesDir)
             val created = WaBridge(this)
@@ -126,13 +139,36 @@ object WaCallEngine : WaListener {
             val mapping = runCatching { bridge.resolveLids(lids) }
                 .getOrDefault(emptyList())
                 .associate { it.lid to it.pn }
-            if (mapping.isEmpty()) return@launch
-            callLog?.remap(mapping)
-            contacts?.remap(mapping)
+            if (mapping.isNotEmpty()) {
+                callLog?.remap(mapping)
+                contacts?.remap(mapping)
+            }
+            // Self purge: own calls leaked in as peer rows (the wire carries
+            // our own JID in several forms) — drop them from log + contacts.
+            val own = runCatching { bridge.ownJids() }
+                .getOrDefault(emptyList())
+                .map { it.jidUserPart() }
+                .toSet()
+            if (own.isNotEmpty()) {
+                callLog?.removePeers(own)
+                contacts?.removePeers(own)
+            }
         }
     }
 
+    /** Parks the flow at null so a previous call's terminal event can't be
+     *  replayed into the next placement's wait — a stale `CallEnded` made the
+     *  panel flash "call failed" while the real offer rang the peer (orphan). */
+    fun parkEvents() {
+        _events.value = null
+    }
+
     fun version(): String = bridge?.version() ?: "not-started"
+
+    /** The identity-bearing user part of a JID string: everything before the
+     *  `@`, minus any device (`:9`) or agent (`.9`) suffixes. */
+    private fun String.jidUserPart(): String =
+        substringBefore('@').substringBefore('.').substringBefore(':')
 
     /** Own account, once known — a restored session reads it off the session
      *  store at attach time; a fresh pairing gets it with `Paired`. */
@@ -153,14 +189,16 @@ object WaCallEngine : WaListener {
      *  The attempt is logged instantly (the user sees the call in the log
      *  while it still connects) — `CallEnded` never logs. */
     suspend fun placeCall(phoneOrJid: String) {
+        Log.i(TAG, "placeCall: callLog=${callLog != null} peerLen=${phoneOrJid.length}")
         currentCallPeer = phoneOrJid
         currentCallOutgoing = true
+        currentCallLogAt = System.currentTimeMillis()
         callLog?.add(
             CallLogEntry(
                 peer = phoneOrJid,
                 outgoing = true,
                 missed = false,
-                at = System.currentTimeMillis(),
+                at = currentCallLogAt,
             ),
         )
         try {
@@ -276,6 +314,7 @@ object WaCallEngine : WaListener {
                 // Glare: with a call already up (peer set), a second offer
                 // must not adopt its peer — the UI declines to route it too
                 // (HomeViewModel); the bridge-side guard is a follow-up.
+                Log.i(TAG, "incoming offer: glare=${currentCallPeer != null}")
                 if (currentCallPeer == null) {
                     currentCallPeer = event.peer
                     currentCallOutgoing = false
@@ -298,6 +337,7 @@ object WaCallEngine : WaListener {
                 // branch below reads it, and the two launches must not race.
                 currentCallStarted = true
                 pendingIncomingPeer = null
+                currentCallConnectedAt = System.currentTimeMillis()
                 Ringer.stop()
                 scope.launch {
                     // The answer tap (or, for an outgoing call, the still-open
@@ -315,12 +355,13 @@ object WaCallEngine : WaListener {
                     // call logs the moment it comes up. `CallEnded` never logs.
                     if (!currentCallOutgoing) {
                         currentCallPeer?.let { peer ->
+                            currentCallLogAt = currentCallConnectedAt
                             callLog?.add(
                                 CallLogEntry(
                                     peer = peer,
                                     outgoing = false,
                                     missed = false,
-                                    at = System.currentTimeMillis(),
+                                    at = currentCallLogAt,
                                 ),
                             )
                         }
@@ -330,18 +371,31 @@ object WaCallEngine : WaListener {
             is WaEvent.CallEnded -> {
                 // Captured synchronously for the same race reason.
                 val started = currentCallStarted
+                val connectedFor = if (started) currentCallConnectedAt else 0L
+                val logPeer = currentCallPeer
+                val logAt = currentCallLogAt
+                val logOutgoing = currentCallOutgoing
                 currentCallStarted = false
+                currentCallConnectedAt = 0
                 activeScreenRouted = false
                 Ringer.stop()
                 scope.launch {
                     // Exactly-once per call (bridge-side dedup) — this is the
                     // single place the audio plane and the log are torn down.
-                    // Logging happens at placement / start / missed — never
-                    // here.
+                    // Logging happens at placement / start / missed — the
+                    // duration is filled in here, at the connected end.
                     CallTone.playDisconnect()
                     audioLink?.stop()
                     audioLink = null
                     appContext?.let { WaCallService.tryStop(it) }
+                    if (started && logPeer != null && logAt != 0L) {
+                        callLog?.updateDuration(
+                            peer = logPeer,
+                            at = logAt,
+                            outgoing = logOutgoing,
+                            duration = (System.currentTimeMillis() - connectedFor) / 1000,
+                        )
+                    }
                     // A call-surface warning (e.g. the backgrounded mic FGS
                     // start) is obsolete once the call is over.
                     _error.value = null
@@ -408,6 +462,7 @@ object WaCallEngine : WaListener {
                             missed = it.missed,
                             at = it.at.toLong(),
                             duration = it.duration.toLong(),
+                            answeredElsewhere = it.answeredElsewhere,
                         )
                     }
                 }
@@ -426,7 +481,12 @@ object WaCallEngine : WaListener {
                 }
             }
             is WaEvent.ContactsImport -> {
-                contacts?.merge(event.contacts.map { ContactEntry(id = it.id, name = it.name) })
+                val list = event.contacts.map { ContactEntry(id = it.id, name = it.name) }
+                when {
+                    event.replace -> contacts?.replaceAll(list)
+                    event.renameOnly -> contacts?.rename(list)
+                    else -> contacts?.merge(list)
+                }
             }
             else -> Unit
         }

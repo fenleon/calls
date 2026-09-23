@@ -45,8 +45,10 @@ import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import java.util.Locale
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -70,11 +72,17 @@ class HomeViewModel : LightViewModel<Unit>() {
      *  contacts list until the bridge exposes a real contacts API. */
     val log = MutableStateFlow<List<CallLogEntry>>(emptyList())
 
+    /** Contact names by peer JID and bare number — the log shows a name
+     *  when the contact list knows one. */
+    val names = MutableStateFlow<Map<String, String>>(emptyMap())
+
     init {
         log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
+        names.value = contactNames()
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
                 when (event) {
+                    is WaEvent.ContactsImport -> names.value = contactNames()
                     is WaEvent.NeedPairing -> Unit
                     // Pairing is user-driven from Settings (which restarts the
                     // flow for fresh QRs) — the pairing screen observes the
@@ -125,6 +133,14 @@ class HomeViewModel : LightViewModel<Unit>() {
         }
     }
 
+    /** Known contact names, keyed both by full JID and bare number so a log
+     *  entry stored under either form resolves. */
+    private fun contactNames(): Map<String, String> =
+        WaCallEngine.contactEntries()
+            .filter { it.name.isNotEmpty() }
+            .flatMap { listOf(it.id to it.name, peerLabel(it.id) to it.name) }
+            .toMap()
+
     /** One active-call push per call: the dial tap already routed the panel
      *  for outgoing (engine flag), and the ringing panel itself observes
      *  `CallStarted` — a later event must not stack a second screen. */
@@ -141,6 +157,7 @@ class HomeViewModel : LightViewModel<Unit>() {
         // a return to home must not show a stale list.
         incomingActive.value = false
         log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
+        names.value = contactNames()
     }
 }
 
@@ -157,6 +174,7 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val log by viewModel.log.collectAsState()
+        val names by viewModel.names.collectAsState()
 
         LightTheme(colors = themeColors) {
             Column(
@@ -184,6 +202,7 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                     // upward, and a new entry lands at the bottom even when
                     // the list is short. Rows are ~3.75gu tall (scrollbar
                     // estimate).
+                    val grouped = groupMissedCalls(log)
                     LightLazyScrollView(
                         modifier = Modifier.weight(1f),
                         reverseLayout = true,
@@ -192,9 +211,13 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
                         // math uses this as the uniform height.
                         uniformItemHeightGridUnits = 6.45f,
                     ) {
-                        items(log.asReversed()) { entry ->
+                        items(grouped.asReversed()) { (entry, missedCount) ->
                             CallLogRow(
                                 entry = entry,
+                                missedCount = missedCount,
+                                peerDisplay = names[entry.peer]
+                                    ?: names[peerLabel(entry.peer)]
+                                    ?: formatPeer(entry.peer),
                                 onClick = {
                                     navigateTo(screenFactory = { activity ->
                                         DialScreen(activity, peerLabel(entry.peer))
@@ -236,13 +259,21 @@ class HomeScreen(sealedActivity: SealedLightActivity) :
  *  duration ("0m 12s", "0s") under the glyph line. Native glyph ≈60px
  *  (1.5gu; the 2gu bar-button size reads oversized in the log). */
 @Composable
-private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
+private fun CallLogRow(entry: CallLogEntry, missedCount: Int, peerDisplay: String, onClick: () -> Unit) {
     val outgoing = entry.outgoing && !entry.missed
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onClick)
-            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
+            // End inset 0: the list's scrollbar gutter (2gu) is the only
+            // right spacing, so outgoing rows sit the thumb-to-edge distance
+            // from the scrollbar (feedback 2026-09-22).
+            .padding(
+                start = 2f.gridUnitsAsDp(),
+                end = 0f.gridUnitsAsDp(),
+                top = 1f.gridUnitsAsDp(),
+                bottom = 1f.gridUnitsAsDp(),
+            ),
         horizontalAlignment = if (outgoing) Alignment.End else Alignment.Start,
     ) {
         LightText(text = formatAt(entry.at), variant = LightTextVariant.Superfine)
@@ -260,7 +291,7 @@ private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
             }
-            LightText(text = formatPeer(entry.peer), variant = LightTextVariant.Copy)
+            LightText(text = peerDisplay, variant = LightTextVariant.Copy)
             if (outgoing) {
                 Spacer(modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()))
                 LightIcon(
@@ -271,12 +302,26 @@ private fun CallLogRow(entry: CallLogEntry, onClick: () -> Unit) {
                 )
             }
         }
-        Spacer(modifier = Modifier.padding(top = 0.75f.gridUnitsAsDp()))
-        LightText(text = formatDuration(entry.duration), variant = LightTextVariant.Superfine)
+        Spacer(modifier = Modifier.padding(top = 0.25f.gridUnitsAsDp()))
+        LightText(
+            text = when {
+                entry.missed -> if (missedCount > 1) "missed call ($missedCount)" else "missed call"
+                entry.duration > 0 -> formatDuration(entry.duration)
+                // ACCEPTEDELSEWHERE with no wire duration — our device wasn't
+                // a party to the connected call. A duration>0 elsewhere row
+                // (they exist — the wire often carries it) shows above.
+                entry.answeredElsewhere -> "answered elsewhere"
+                else -> formatDuration(entry.duration)
+            },
+            variant = LightTextVariant.Superfine,
+        )
     }
 }
 
-/** Native duration rendering: "0m 16s", "2m 05s", "0s" for unanswered. */
+/** Native duration rendering: "0m 16s", "2m 05s". Missed calls render the
+ *  lowercase "missed call" label, accepted-elsewhere calls "answered
+ *  elsewhere" — the wire carries no duration for a call our device wasn't
+ *  a party to (feedback 2026-09-22). */
 internal fun formatDuration(seconds: Long): String {
     if (seconds == 0L) return "0s"
     val m = seconds / 60
@@ -297,6 +342,48 @@ internal fun formatPeer(peer: String): String {
         ?: "+$digits"
 }
 
-private fun formatAt(at: Long): String =
-    Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault())
-        .format(DateTimeFormatter.ofPattern("MMM d h:mm a"))
+/** Row timestamp in the Chats room-row grammar (feedback 2026-09-23): today
+ *  shows the time only — the only rows that carry one — the past 6 days show
+ *  the full day name with no time ("Monday"), and older calls show the whole
+ *  date (year joins for previous years). Row order stays by time. */
+private fun formatAt(at: Long): String {
+    val zone = ZoneId.systemDefault()
+    val dateTime = Instant.ofEpochMilli(at).atZone(zone)
+    val today = LocalDate.now(zone)
+    val date = dateTime.toLocalDate()
+    return when {
+        date == today -> dateTime.toLocalTime().format(TIME_FORMAT)
+        date.isAfter(today.minusDays(7)) ->
+            date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.US)
+        date.year == today.year -> date.format(MONTH_DAY_FORMAT)
+        else -> date.format(MONTH_DAY_YEAR_FORMAT)
+    }
+}
+
+private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private val MONTH_DAY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d")
+private val MONTH_DAY_YEAR_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d, yyyy")
+
+/** Collapses runs of missed calls from one peer on the same local day into a
+ *  single row — "missed call (x)" (feedback 2026-09-23). The row keeps the
+ *  LATEST call's entry (ordering stays by time); only consecutive runs merge,
+ *  so a later non-missed row to the same peer starts a fresh group. */
+internal fun groupMissedCalls(entries: List<CallLogEntry>): List<Pair<CallLogEntry, Int>> {
+    val rows = mutableListOf<Pair<CallLogEntry, Int>>()
+    for (entry in entries) {
+        val last = rows.lastOrNull()
+        if (
+            entry.missed && last != null && last.first.missed &&
+            last.first.peer == entry.peer && sameDay(last.first.at, entry.at)
+        ) {
+            rows[rows.lastIndex] = entry to last.second + 1
+        } else {
+            rows.add(entry to 1)
+        }
+    }
+    return rows
+}
+
+private fun sameDay(a: Long, b: Long): Boolean =
+    Instant.ofEpochMilli(a).atZone(ZoneId.systemDefault()).toLocalDate() ==
+        Instant.ofEpochMilli(b).atZone(ZoneId.systemDefault()).toLocalDate()

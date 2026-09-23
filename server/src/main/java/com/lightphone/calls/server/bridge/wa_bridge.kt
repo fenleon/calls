@@ -774,6 +774,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -796,6 +798,8 @@ fun uniffi_wa_bridge_checksum_method_wabridge_accept_call(
 fun uniffi_wa_bridge_checksum_method_wabridge_account(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_logout(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_own_jids(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_place_call(
 ): Short
@@ -885,6 +889,8 @@ fun uniffi_wa_bridge_fn_method_wabridge_account(`ptr`: Pointer,uniffi_out_err: U
 ): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_logout(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_own_jids(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_wa_bridge_fn_method_wabridge_place_call(`ptr`: Pointer,`phoneOrJid`: RustBuffer.ByValue,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_recv_playout_pcm(`ptr`: Pointer,`timeoutMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1049,6 +1055,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_logout() != 42824.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_own_jids() != 47759.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_place_call() != 38868.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1061,7 +1070,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_reset_session() != 22808.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_wa_bridge_checksum_method_wabridge_resolve_lids() != 5921.toShort()) {
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_resolve_lids() != 48365.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_restart_pairing() != 15675.toShort()) {
@@ -1576,6 +1585,17 @@ public interface WaBridgeInterface {
     fun `logout`()
     
     /**
+     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
+     * mapping table (usync answers are learned there). Returns only the pairs
+     * that resolved — the engine rewrites its stores onto the phone JID, the
+     * identity that is stable across ingest paths (history-sync blob, live
+     * events), collapsing the duplicates the two paths produced.
+     * The linked account's own JID strings (PN + LID) — the caller purges
+     * self-rows from its stores (own calls leaked in as peers).
+     */
+    fun `ownJids`(): List<kotlin.String>
+    
+    /**
      * Places a 1:1 call. `phone_or_jid` is a bare phone number (an E.164
      * `+`-prefix is fine) or a full JID. Returns the call id. The call rings
      * until the peer answers: this reports `Ringing` (F1) and `CallStarted`
@@ -1607,13 +1627,6 @@ public interface WaBridgeInterface {
      */
     fun `resetSession`()
     
-    /**
-     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
-     * mapping table (usync answers are learned there). Returns only the pairs
-     * that resolved — the engine rewrites its stores onto the phone JID, the
-     * identity that is stable across ingest paths (history-sync blob, live
-     * events), collapsing the duplicates the two paths produced.
-     */
     suspend fun `resolveLids`(`lids`: List<kotlin.String>): List<WaLidMapping>
     
     /**
@@ -1818,6 +1831,27 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
 
     
     /**
+     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
+     * mapping table (usync answers are learned there). Returns only the pairs
+     * that resolved — the engine rewrites its stores onto the phone JID, the
+     * identity that is stable across ingest paths (history-sync blob, live
+     * events), collapsing the duplicates the two paths produced.
+     * The linked account's own JID strings (PN + LID) — the caller purges
+     * self-rows from its stores (own calls leaked in as peers).
+     */override fun `ownJids`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_own_jids(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Places a 1:1 call. `phone_or_jid` is a bare phone number (an E.164
      * `+`-prefix is fine) or a full JID. Returns the call id. The call rings
      * until the peer answers: this reports `Ringing` (F1) and `CallStarted`
@@ -1908,13 +1942,6 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     
 
     
-    /**
-     * Resolves stored raw-LID JIDs against the session's persisted LID→phone
-     * mapping table (usync answers are learned there). Returns only the pairs
-     * that resolved — the engine rewrites its stores onto the phone JID, the
-     * identity that is stable across ingest paths (history-sync blob, live
-     * events), collapsing the duplicates the two paths produced.
-     */
     @Throws(WaException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `resolveLids`(`lids`: List<kotlin.String>) : List<WaLidMapping> {
@@ -2110,6 +2137,10 @@ data class WaCallRecord (
     var `outgoing`: kotlin.Boolean, 
     var `missed`: kotlin.Boolean, 
     /**
+     * Accepted on another linked device — no wire duration exists.
+     */
+    var `answeredElsewhere`: kotlin.Boolean, 
+    /**
      * Connected duration in seconds (0 for unanswered calls).
      */
     var `duration`: kotlin.ULong
@@ -2128,6 +2159,7 @@ public object FfiConverterTypeWaCallRecord: FfiConverterRustBuffer<WaCallRecord>
             FfiConverterULong.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
         )
     }
@@ -2137,6 +2169,7 @@ public object FfiConverterTypeWaCallRecord: FfiConverterRustBuffer<WaCallRecord>
             FfiConverterULong.allocationSize(value.`at`) +
             FfiConverterBoolean.allocationSize(value.`outgoing`) +
             FfiConverterBoolean.allocationSize(value.`missed`) +
+            FfiConverterBoolean.allocationSize(value.`answeredElsewhere`) +
             FfiConverterULong.allocationSize(value.`duration`)
     )
 
@@ -2145,6 +2178,7 @@ public object FfiConverterTypeWaCallRecord: FfiConverterRustBuffer<WaCallRecord>
             FfiConverterULong.write(value.`at`, buf)
             FfiConverterBoolean.write(value.`outgoing`, buf)
             FfiConverterBoolean.write(value.`missed`, buf)
+            FfiConverterBoolean.write(value.`answeredElsewhere`, buf)
             FfiConverterULong.write(value.`duration`, buf)
     }
 }
@@ -2413,11 +2447,16 @@ sealed class WaEvent {
     }
     
     /**
-     * Names + numbers of everyone the account has interacted with
-     * (history-sync pushnames + conversation JIDs). Never message content.
+     * Names + numbers of people the account has 1:1 history with.
+     * `replace`: the pairing history-sync's authoritative peer set — swaps
+     * the whole list (purges stale entries). `renameOnly`: push-name
+     * updates — only rename contacts already in the list (pushnames alone
+     * never add a peer: they cover every group participant).
      */
     data class ContactsImport(
-        val `contacts`: List<WaContact>) : WaEvent() {
+        val `contacts`: List<WaContact>, 
+        val `replace`: kotlin.Boolean, 
+        val `renameOnly`: kotlin.Boolean) : WaEvent() {
         companion object
     }
     
@@ -2462,6 +2501,8 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
                 )
             12 -> WaEvent.ContactsImport(
                 FfiConverterSequenceTypeWaContact.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterBoolean.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -2548,6 +2589,8 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             (
                 4UL
                 + FfiConverterSequenceTypeWaContact.allocationSize(value.`contacts`)
+                + FfiConverterBoolean.allocationSize(value.`replace`)
+                + FfiConverterBoolean.allocationSize(value.`renameOnly`)
             )
         }
     }
@@ -2610,6 +2653,8 @@ public object FfiConverterTypeWaEvent : FfiConverterRustBuffer<WaEvent>{
             is WaEvent.ContactsImport -> {
                 buf.putInt(12)
                 FfiConverterSequenceTypeWaContact.write(value.`contacts`, buf)
+                FfiConverterBoolean.write(value.`replace`, buf)
+                FfiConverterBoolean.write(value.`renameOnly`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

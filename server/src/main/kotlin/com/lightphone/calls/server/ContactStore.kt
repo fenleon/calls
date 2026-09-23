@@ -44,4 +44,36 @@ class ContactStore(dir: File) {
             .sortedBy { it.id }
         file.writeText(json.encodeToString(ListSerializer(ContactEntry.serializer()), healed))
     }
+
+    /** Drops entries whose id is one of the given JID user parts (self rows:
+     *  our own identity leaked into the contact list). */
+    @Synchronized
+    fun removePeers(ownUsers: Set<String>) {
+        val list = all().filter {
+            it.id.substringBefore('@').substringBefore('.').substringBefore(':') !in ownUsers
+        }
+        if (list.size == all().size) return
+        file.writeText(json.encodeToString(ListSerializer(ContactEntry.serializer()), list))
+    }
+
+    /** Pairing history-sync import: the authoritative 1:1 peer set —
+     *  replaces the stored list (purges stale entries). */
+    @Synchronized
+    fun replaceAll(contacts: List<ContactEntry>) {
+        val byId = contacts
+            .filter { it.id.contains('@') }
+            .associateBy { it.id }
+            .mapValues { (_, c) -> c.copy(name = c.name.trim()) }
+        file.writeText(json.encodeToString(ListSerializer(ContactEntry.serializer()), byId.values.sortedBy { it.id }))
+    }
+
+    /** Push-name updates: rename existing entries only — a pushname alone
+     *  never adds a peer (it covers every group participant). */
+    @Synchronized
+    fun rename(contacts: List<ContactEntry>) {
+        val names = contacts.filter { it.name.isNotEmpty() }.associateBy { it.id }
+        if (names.isEmpty()) return
+        val renamed = all().map { names[it.id]?.let { n -> it.copy(name = n.name) } ?: it }
+        file.writeText(json.encodeToString(ListSerializer(ContactEntry.serializer()), renamed))
+    }
 }

@@ -79,6 +79,7 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     fun place(peer: String) {
         viewModelScope.launch {
             try {
+                WaCallEngine.parkEvents()
                 val routed = withTimeoutOrNull(60_000) {
                     WaCallEngine.placeCall(peer)
                     WaCallEngine.events.first {
