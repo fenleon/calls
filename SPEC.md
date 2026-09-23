@@ -65,21 +65,21 @@ async fn set_muted(&self, muted: bool) -> Result<(), WaError>;
 // data plane (sync, called from dedicated Kotlin threads)
 fn send_mic_pcm(&self, samples: Vec<i16>) -> Result<(), WaError>;          // 960 samples / 60 ms
 fn recv_playout_pcm(&self, timeout_ms: u32) -> Vec<i16>;                   // 960 samples; empty = starved
-fn request_peer_keyframe(&self, immediate: bool);                          // KeyframeUrgency
 
-// video (M3)
-fn send_video_au(&self, au: Vec<u8>) -> Result<(), WaError>;               // complete Annex-B AU
-fn recv_video_au(&self, timeout_ms: u32) -> Option<UniVideoFrame>;         // data + keyframe + orientation
-async fn start_video(&self) -> Result<(), WaError>;
-async fn accept_video(&self, token: VideoUpgradeToken) -> Result<(), WaError>;
-async fn stop_video(&self) -> Result<(), WaError>;
-fn video_states(&self) -> Option<VideoStates>;                             // (self, peer)
+// video (M3) — bridge owns the channels (mic/playout pattern); Kotlin pushes/pulls sync
+fn send_video_au(&self, au: Vec<u8>) -> Result<bool, WaError>;             // complete Annex-B AU; Ok(dropped)
+fn recv_video_frame(&self, timeout_ms: u32) -> Option<WaVideoFrame>;       // { data, keyframe, orientation }
+async fn start_video(&self, fps: u32) -> Result<(), WaError>;              // attaches VideoSource/Sink; stride = 90_000/fps
+async fn accept_video(&self, token: WaVideoUpgradeToken, fps: u32) -> Result<(), WaError>; // { generation, epoch }
+async fn stop_video(&self) -> Result<(), WaError>;                         // idempotent
+fn announce_video_enabled(&self) -> Result<(), WaError>;                   // <video state=1> after mid-call upgrade
+// place_call/accept_call gain `with_video: bool` → builder .video(...) (video-from-start)
 ```
 
 Bridge rules:
 
 - **Pacing:** Kotlin's AudioRecord/AudioTrack threads own the clock (60 ms blocks). Mic push is bounded/drop-oldest (never block the capture thread); playout pull blocks with timeout. The engine paces playout itself (jitter buffer exists — see `playout_trimmed_samples` stat).
-- **Events:** one consumer on `handle.events()` (cloned consumers share one queue — the bridge owns the single consumer) mapping the library's `Event`/`CallEvent` onto a Kotlin enum: `NeedPairing`, `PairingQr`, `IncomingCall { is_video, peer }`, `CallStarted`, `CallEnded { reason }`, `MissedCall`, `EndedElsewhere`, `VideoStateChanged { state, upgrade_token }`, `VideoKeyframeNeeded`, `AudioSilent { reason, silent_for_ms }`, `AudioReceptionStalled`, `MediaSetupFailed`, `RelayAllocateFailed`. Callbacks arrive on Rust threads — generated shim enqueues; Kotlin hops to the main dispatcher.
+- **Events:** one consumer on `handle.events()` (cloned consumers share one queue — the bridge owns the single consumer) mapping the library's `Event`/`CallEvent` onto a Kotlin enum: `NeedPairing`, `PairingQr`, `IncomingCall { is_video, peer }`, `CallStarted`, `CallEnded { reason }`, `MissedCall`, `EndedElsewhere`, `VideoStateChanged { state, orientation, upgrade_token }`, `OutboundVideoDropped`, `AudioSilent { reason, silent_for_ms }`, `AudioReceptionStalled`, `MediaSetupFailed`, `RelayAllocateFailed`. Callbacks arrive on Rust threads — generated shim enqueues; Kotlin hops to the main dispatcher.
 - **Redaction:** the library redacts SRTP/HBH keying material in Debug; the bridge additionally never logs JIDs, tokens, or session material (workspace privacy rule).
 - Pin the crate version/rev exactly; the API moved under us at least three times during 2026 (`accept_video` signature, `terminate()` rename, codec-selection fix — PRs #1051/#1351/#1111). Bump only with a re-read of the guide's warning section.
 
@@ -103,7 +103,7 @@ Bridge rules:
 
 - **Encode:** Camera2 (front) → `MediaCodec` `video/avc`, **Constrained Baseline L3.1**, no B-frames, one slice/frame. Tiers: 480p@15 fps ~600 kbps (default/cellular), 720p@20 fps ~1.8 Mbps (WiFi). GOP 30. `VideoSource.rtp_timestamp_stride()` must equal `90_000 / fps` — declare it to match the encoder tier.
 - **CSD repetition:** MediaCodec hands out SPS/PPS once as CSD; Kotlin must prepend them to **every** IDR AU before `send_video_au` (the engine packs them into one STAP-A, PR #1496, but only if the AU carries them). Deterministic test: every AU flagged keyframe contains SPS+PPS+IDR.
-- **Keyframes:** react to `VideoKeyframeNeeded` with `MediaCodec PARAMETER_KEY_REQUEST_SYNC_FRAME` + `request_peer_keyframe(immediate)`; the engine withholds dependent AUs after peer PLI until the next IDR. On local queue overflow: drop-oldest + request a sync frame.
+- **Keyframes:** peer PLI/FIR is handled engine-internally (`VideoControl::RequireKeyframe`) — V1-Q1 in VIDEO-PLAN.md traces how/if it reaches the `VideoSource`; locally, on `send_video_au` returning dropped, request `MediaCodec PARAMETER_KEY_REQUEST_SYNC_FRAME` (bridge queue is drop-oldest).
 - **Decode:** `recv_video_au` pull thread → `video/avc` decoder → `SurfaceView` (not TextureView). Hold AUs until first keyframe; seed decoder config from its SPS/PPS. `KEY_LOW_LATENCY=1`.
 - **Orientation:** send sensor-native frames; `VideoFrame.orientation` from the peer is applied at render. ⚠ Verify the orientation value convention against a real call before shipping.
 - Final accept for video-from-start calls gates on "first decodable SPS/PPS/IDR pushed" — pre-warm the camera when the ring UI appears (camera open is ~300–800 ms).

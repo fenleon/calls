@@ -58,7 +58,12 @@ LightOS service method.
   reads too low/high (measured baseline: glyph bottom == digit baseline).
 - Incoming-call centering + duration gap — confirmed or adjust.
 
-## 5. Battery / lifecycle audit (standing priority)
+## 5. M3 — 1:1 video calls
+
+Planned in `VIDEO-PLAN.md` (phases V0–V4, grounded in the vendored lib's real
+video API — SPEC §2/§3.3 corrected 2026-09-23). §1/§2 above land first.
+
+## 6. Battery / lifecycle audit (standing priority)
 
 Audit `WaSyncService` + `WaCallService` FGS CPU/wakeups on the LP3 now that the
 relay and ringer run at bootstrap (the standing doze-disabled caveat applies).
