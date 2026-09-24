@@ -1,0 +1,336 @@
+From 13710b04d7a56fb8597eeb2bf48adab686a6397a Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 10:36:08 +0200
+Subject: [PATCH] local session work 2026-09-22..24: terminate per-device
+ fan-out, caller_pn revert (probe evidence), voip stanza logging, video
+ device_orientation signaling
+
+---
+ src/client/voip.rs        | 58 ++++++++++++++++++++++++++++++++-------
+ src/handlers/call.rs      |  1 +
+ src/voip/facade.rs        | 49 ++++++++++++++++++++++++++-------
+ wacore/src/stanza/call.rs | 27 ++++++++++++++----
+ 4 files changed, 110 insertions(+), 25 deletions(-)
+
+diff --git a/src/client/voip.rs b/src/client/voip.rs
+index ddf0d3e0..0512cc80 100644
+--- a/src/client/voip.rs
++++ b/src/client/voip.rs
+@@ -1821,22 +1821,60 @@ impl Voip<'_> {
+         if call_id.is_empty() {
+             return Err(CallError::EmptyCallId);
+         }
+-        let id = self.client.generate_request_id();
+-        let stanza = build_terminate(&TerminateParams {
+-            call_id,
+-            to: peer,
+-            id: Some(&id),
+-            call_creator,
+-            reason: None,
+-        });
+-        let sent = self.client.send_node(stanza).await;
++        // Call signaling routes per device: a bare-JID terminate from a companion sender
++        // reaches only the peer's PRIMARY, leaving the peer's other devices ringing a call
++        // nobody can answer (observed 2026-09-23). WA Web therefore sends one terminate per
++        // device JID (see `TerminateParams.to`). Resolve the peer's devices and fan out; on
++        // resolution failure fall back to the single bare-peer stanza (the pre-fix behavior).
++        let mut targets = match self
++            .client
++            .signal()
++            .get_user_devices(std::slice::from_ref(peer))
++            .await
++        {
++            #[cfg(feature = "voip-runtime")]
++            Ok(fetched) => crate::voip::facade::drop_hosted_devices(fetched),
++            #[cfg(not(feature = "voip-runtime"))]
++            Ok(fetched) => fetched,
++            Err(error) => {
++                log::warn!("voip: terminate peer-device resolve failed, bare fallback: {error}");
++                Vec::new()
++            }
++        };
++        if targets.is_empty() {
++            targets.push(peer.clone());
++        }
++        let mut last_error = None;
++        let mut sent_any = false;
++        for device in &targets {
++            let id = self.client.generate_request_id();
++            let stanza = build_terminate(&TerminateParams {
++                call_id,
++                to: device,
++                id: Some(&id),
++                call_creator,
++                reason: None,
++            });
++            log::info!("voip: sending terminate stanza: {stanza:?}");
++            match self.client.send_node(stanza).await {
++                Ok(()) => sent_any = true,
++                Err(error) => {
++                    log::warn!("voip: terminate to {} failed: {error}", device.observe());
++                    last_error = Some(error)
++                }
++            }
++        }
+         // Tear the local call down regardless of whether the stanza reached the peer: the app asked to
+         // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
+         // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
+         // `<terminate>` triggers so the public hangup actually ends our side too.
+         #[cfg(feature = "voip-runtime")]
+         crate::voip::facade::terminate_call(self.client, call_id);
+-        sent?;
++        if let Some(error) = last_error
++            && !sent_any
++        {
++            return Err(error.into());
++        }
+         Ok(())
+     }
+ }
+diff --git a/src/handlers/call.rs b/src/handlers/call.rs
+index 6b54d937..07b6a64f 100644
+--- a/src/handlers/call.rs
++++ b/src/handlers/call.rs
+@@ -60,6 +60,7 @@ impl StanzaHandler for CallHandler {
+         cancelled: &mut bool,
+     ) -> bool {
+         let nr = node.get();
++        log::info!("voip: recv call node: {nr:?}");
+         let typed_control_type = nr
+             .children()
+             .and_then(|children| {
+diff --git a/src/voip/facade.rs b/src/voip/facade.rs
+index 196cefa6..1efe94fc 100644
+--- a/src/voip/facade.rs
++++ b/src/voip/facade.rs
+@@ -7,7 +7,7 @@
+ use std::future::Future;
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+ use std::time::Duration;
+ 
+ use bytes::Bytes;
+@@ -1134,7 +1134,7 @@ impl VideoEndpoints {
+ 
+ /// Drop hosted (Cloud-API) companions from the offer's device set: the client never establishes
+ /// Signal sessions for them, so a callKey `<enc>` to one would fail or emit an unusable `<to>`.
+-fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
++pub(crate) fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
+     devices.retain(|d| !d.is_hosted());
+     devices
+ }
+@@ -1713,12 +1713,20 @@ async fn place_call(
+     // The offer needs a stanza id so the server can ack-correlate it: the initiator's relay rides
+     // back on the `<ack type=offer>` reply to THIS id, not on a later <call>.
+     let offer_stanza_id = client.generate_request_id();
++    // REVERTED 2026-09-23 (probe evidence): emitting caller_pn — even in the exact
++    // captured WA Web form (bare pn JID, device 0, on <offer>), with the WA Web
++    // companions (caller_country_code, joinable) and wrapper identity
++    // (version/platform/notify) — makes the server drop the offer with NO ack.
++    // Baseline without the attr acks+relays in <1 s; the same drop happens from
++    // an aged account (LP3), so it is client-fingerprint gating, not attr shape.
++    // Keep caller_pn: None until upstream learns the trust signal WA Web offers carry.
+     let audio_rate = audio.signaling_rate().to_string();
+     let audio_rates = [audio_rate.as_str()];
+     let offer = build_offer(&OfferParams {
+         call_id: &call_id,
+         to: peer,
+         call_creator,
++        caller_pn: None,
+         device_keys: &device_keys,
+         privacy_token: privacy_token.as_deref(),
+         capability: Some(offer_capability(video.is_some(), audio.config().format)),
+@@ -1815,6 +1823,7 @@ async fn place_call(
+     // If the send fails, undo the registration: drop the (generation-guarded) pending entry, reap our
+     // registry generation, drop the dangling ack-waiter, and wake any wait_ended() waiter, then
+     // propagate. Guarded so a same-call-id replacement that already superseded us isn't evicted.
++    log::info!("voip: send offer node={offer:?}");
+     if let Err(e) = client.send_node(offer).await {
+         let removed = take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
+         registry.remove_if_current(&call_id, generation);
+@@ -1899,8 +1908,15 @@ fn spawn_outgoing_relay_waiter(
+                 match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
+                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
+                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
+-                    Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
+-                        .and_then(wacore::voip::relay_parse::parse_relay_data),
++                    Ok(Ok(ack)) => {
++                        let relay = wacore::stanza::call::find_relay(ack.get())
++                            .and_then(wacore::voip::relay_parse::parse_relay_data);
++                        log::info!(
++                            "voip: offer ack arrived, relay_present={} ack={ack:?}",
++                            relay.is_some()
++                        );
++                        relay
++                    }
+                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
+                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
+                     // here or send_keepalive suppresses pings for the life of the connection.
+@@ -2794,6 +2810,9 @@ pub(crate) struct VideoShared {
+     feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
+     /// Receiver halves parked until `attach_engine` hands them to the drive loop.
+     receivers: std::sync::Mutex<Option<VideoReceivers>>,
++    /// This device's orientation in 90° steps (0..3), signaled in outbound `<video>` stanzas.
++    /// Set by the consumer (from the camera sensor) before/at encode start.
++    device_orientation: AtomicU8,
+ }
+ 
+ /// The drive-loop halves of the video channels: (outbound AUs, plane control).
+@@ -2809,6 +2828,7 @@ impl VideoShared {
+             sink_slot: Arc::new(std::sync::Mutex::new(None)),
+             feed: std::sync::Mutex::new(None),
+             receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
++            device_orientation: AtomicU8::new(0),
+         }
+     }
+ 
+@@ -3137,6 +3157,19 @@ impl CallHandle {
+         &self.call_id
+     }
+ 
++    /// Set this device's orientation (90° steps 0..3) signaled in outbound `<video>` stanzas.
++    /// Fork patch — provenance tracked in the calls repo (LIGHT-SDK-PATCHES.md equivalent).
++    pub fn set_device_orientation(&self, orientation: u8) {
++        self.video
++            .device_orientation
++            .store(orientation % 4, Ordering::Relaxed);
++    }
++
++    /// The currently set device orientation (90° steps 0..3).
++    pub fn device_orientation(&self) -> u8 {
++        self.video.device_orientation.load(Ordering::Relaxed)
++    }
++
+     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
+     /// call-scoped JID after an ad-hoc group promotion, otherwise the callee device that answered
+     /// (learned from the inbound `<accept>`) once one has, since direct-call signaling is addressed
+@@ -3415,7 +3448,7 @@ impl CallHandle {
+             call_creator: &self.call_creator,
+             state: VideoState::Enabled,
+             dec: Some(VIDEO_DEC_REQUEST),
+-            device_orientation: Some(0),
++            device_orientation: Some(self.device_orientation()),
+         });
+         client.send_node(stanza).await?;
+         Ok(())
+@@ -3554,7 +3587,7 @@ impl CallHandle {
+                 call_creator: &self.call_creator,
+                 state,
+                 dec,
+-                device_orientation: Some(0),
++                device_orientation: Some(self.device_orientation()),
+             });
+             let client = client.clone();
+             async move { client.send_node(stanza).await }
+@@ -4447,9 +4480,7 @@ mod tests {
+                 call_id: "CALL-AUDIO-MISMATCH".into(),
+                 call_creator: caller(),
+                 caller_pn: None,
+-                caller_country_code: None,
+                 device_class: None,
+-                joinable: false,
+                 is_video: false,
+                 audio: vec![wacore::types::call::CallAudioCodec {
+                     enc: "opus".into(),
+@@ -4483,9 +4514,7 @@ mod tests {
+                 call_id: "CALL-ANSWER-SIGNALING".into(),
+                 call_creator: caller(),
+                 caller_pn: None,
+-                caller_country_code: None,
+                 device_class: None,
+-                joinable: false,
+                 is_video: video,
+                 audio: vec![wacore::types::call::CallAudioCodec {
+                     enc: "opus".into(),
+diff --git a/wacore/src/stanza/call.rs b/wacore/src/stanza/call.rs
+index 603dd2b5..9d21d230 100644
+--- a/wacore/src/stanza/call.rs
++++ b/wacore/src/stanza/call.rs
+@@ -516,6 +516,11 @@ pub struct OfferParams<'a> {
+     pub call_id: &'a str,
+     pub to: &'a Jid,
+     pub call_creator: &'a Jid,
++    /// The caller's real-number Jid (`pn`), as WA Web sends it: callee devices
++    /// render the offer/missed-call display from this without a usync lookup.
++    /// Absent on privacy-tightened clients; the callee falls back to a LID
++    /// resolution.
++    pub caller_pn: Option<&'a Jid>,
+     pub device_keys: &'a [OfferDeviceKey],
+     pub privacy_token: Option<&'a [u8]>,
+     pub capability: Option<&'a [u8]>,
+@@ -580,11 +585,17 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
+         );
+     }
+ 
+-    call_wrap(
+-        p.to,
+-        p.id,
+-        offer_action("offer", p.call_id, p.call_creator, children),
+-    )
++    let action = match p.caller_pn {
++        Some(pn) => NodeBuilder::new("offer")
++            .attr("call-id", p.call_id)
++            .attr("call-creator", p.call_creator)
++            .attr("caller_pn", pn)
++            .children(children)
++            .build(),
++        None => offer_action("offer", p.call_id, p.call_creator, children),
++    };
++
++    call_wrap(p.to, p.id, action)
+ }
+ 
+ fn enc_node(dk: &OfferDeviceKey) -> Node {
+@@ -1950,6 +1961,7 @@ mod tests {
+             enc_type: "pkmsg".into(),
+         };
+         let call = build_offer(&OfferParams {
++            caller_pn: None,
+             call_id: "CID",
+             to: &peer,
+             call_creator: &creator,
+@@ -2008,6 +2020,7 @@ mod tests {
+             },
+         ];
+         let call = build_offer(&OfferParams {
++            caller_pn: None,
+             call_id: "CID",
+             to: &peer,
+             call_creator: &creator,
+@@ -2035,6 +2048,7 @@ mod tests {
+             enc_type: "msg".into(),
+         };
+         let call = build_offer(&OfferParams {
++            caller_pn: None,
+             call_id: "CID",
+             to: &peer,
+             call_creator: &creator,
+@@ -2071,6 +2085,7 @@ mod tests {
+             enc_type: "msg".into(),
+         }];
+         let call = build_offer(&OfferParams {
++            caller_pn: None,
+             call_id: "CID",
+             to: &peer,
+             call_creator: &creator,
+@@ -2529,6 +2544,7 @@ mod tests {
+             enc_type: "msg".into(),
+         };
+         let base = OfferParams {
++            caller_pn: None,
+             call_id: "CID",
+             to: &peer,
+             call_creator: &creator,
+@@ -2555,6 +2571,7 @@ mod tests {
+         );
+ 
+         let no_video = build_offer(&OfferParams {
++            caller_pn: None,
+             video: false,
+             ..base
+         });
+-- 
+2.43.0
+
