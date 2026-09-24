@@ -58,6 +58,20 @@ object WaCallEngine : WaListener {
         _liveEvents.tryEmit(event)
     }
 
+    /** The live incoming offer home routes from — engine STATE, not an
+     *  event. A cold-start offer lands mid-launch (the bot can receive it
+     *  before the activity is even up), and home's event collector
+     *  subscribes late: the events StateFlow only replays its LAST value,
+     *  which a following history-sync import or the caller's terminate has
+     *  often already replaced — the offer was lost and the panel never
+     *  routed (2026-09-25 live regression: incoming call during a cold
+     *  start was never shown). This StateFlow holds the offer for exactly
+     *  as long as it lives, so a late-subscribing collector still routes
+     *  it. Cleared on accept (→ `CallStarted`), reject, `MissedCall`,
+     *  `CallEnded`, [dropCurrentCall]. */
+    private val _pendingOffer = MutableStateFlow<WaEvent.IncomingCall?>(null)
+    val pendingOffer: StateFlow<WaEvent.IncomingCall?> = _pendingOffer
+
     /** Engine-level failure the UI renders as a small error line (the bridge
      *  process store failed to open, a call connected with the mic FGS start
      *  blocked while backgrounded, …). Cleared on a successful start and
@@ -160,6 +174,7 @@ object WaCallEngine : WaListener {
         currentCallLogAt = 0
         incomingVideoOffer = false
         activeScreenRouted = false
+        _pendingOffer.value = null
     }
 
     fun attach(context: Context) {
@@ -299,6 +314,9 @@ object WaCallEngine : WaListener {
         if (fakeCall) {
             Ringer.stop()
             appContext?.let { WaCallService.tryStart(it) }
+            // Direct publish — the reducer's CallStarted branch doesn't run,
+            // so the offer must be cleared here.
+            _pendingOffer.value = null
             publish(WaEvent.CallStarted(callId = "fake"))
             return
         }
@@ -374,6 +392,9 @@ object WaCallEngine : WaListener {
     /** Fire-and-forget decline of the incoming offer — runs on the engine's
      *  own scope so the decline is sent even if the screen leaves first. */
     fun reject() {
+        // The offer is being declined — nothing left to route (the bridge's
+        // own end event may never come).
+        _pendingOffer.value = null
         // Fake call: the screen closes itself; just release the call state.
         if (fakeCall) {
             dropCurrentCall()
@@ -403,6 +424,8 @@ object WaCallEngine : WaListener {
             fakeCall = false
             CallTone.playDisconnect()
             appContext?.let { WaCallService.tryStop(it) }
+            // Direct publish — the reducer's CallEnded branch doesn't run.
+            _pendingOffer.value = null
             publish(WaEvent.CallEnded(reason = "ended"))
             return
         }
@@ -441,6 +464,9 @@ object WaCallEngine : WaListener {
                     currentCallPeer = event.peer
                     currentCallOutgoing = false
                     incomingVideoOffer = event.isVideo
+                    // The offer home routes from — state, not the event
+                    // stream (see [_pendingOffer]).
+                    _pendingOffer.value = event
                     // Resolved display peer of the ringing offer — survives
                     // the offer's CallEnded (not-started) so a following
                     // MissedCall logs the real number, not the raw LID.
@@ -460,6 +486,8 @@ object WaCallEngine : WaListener {
                 // branch below reads it, and the two launches must not race.
                 currentCallStarted = true
                 pendingIncomingPeer = null
+                // The offer was taken — nothing left to route.
+                _pendingOffer.value = null
                 currentCallConnectedAt = System.currentTimeMillis()
                 Ringer.stop()
                 scope.launch {
@@ -512,6 +540,8 @@ object WaCallEngine : WaListener {
                 currentCallStarted = false
                 currentCallConnectedAt = 0
                 activeScreenRouted = false
+                // The offer (if this ends one) is gone — stop routing it.
+                _pendingOffer.value = null
                 Ringer.stop()
                 scope.launch {
                     // Exactly-once per call (bridge-side dedup) — this is the
@@ -567,6 +597,7 @@ object WaCallEngine : WaListener {
                     currentCallPeer = null
                     incomingVideoOffer = false
                     activeScreenRouted = false
+                    _pendingOffer.value = null
                     Ringer.stop()
                 }
             }

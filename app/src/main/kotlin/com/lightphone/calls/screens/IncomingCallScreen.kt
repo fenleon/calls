@@ -107,14 +107,8 @@ class IncomingCallScreen(
         // Live events only: the `events` StateFlow replays its last value to
         // a fresh collector — a stale `CallEnded` from a call that died while
         // the app was closed flashed "call ended" here and never left
-        // (2026-09-24 LP3 report). The live stream has no replay to cover the
-        // route→subscription gap, so an offer that died in it is closed here:
-        // the engine no longer holds the peer.
+        // (2026-09-24 LP3 report).
         LaunchedEffect(Unit) {
-            if (WaCallEngine.currentCallPeer != peer) {
-                goBack()
-                return@LaunchedEffect
-            }
             WaCallEngine.liveEvents.collect { event ->
                 when (event) {
                     is WaEvent.MissedCall -> if (event.peer == peer) goBack()
@@ -122,6 +116,17 @@ class IncomingCallScreen(
                     else -> Unit
                 }
             }
+        }
+        // The panel's liveness anchor is the pending offer itself, not an
+        // event: the live stream has no replay, so an offer that died in the
+        // route→composition gap delivers nothing to close with. When the
+        // engine no longer holds this offer AND no accepted call is replacing
+        // this panel (accept → `CallStarted` clears the offer while the route
+        // to the active screen replaces us — a blind goBack there could pop
+        // the call panel instead), the panel is stale and closes.
+        val pendingOffer by WaCallEngine.pendingOffer.collectAsState()
+        LaunchedEffect(pendingOffer) {
+            if (pendingOffer == null && WaCallEngine.currentCallPeer == null) goBack()
         }
         LaunchedEffect(permissionRequestTick) {
             if (permissionRequestTick > 0) permissionLauncher?.launch()

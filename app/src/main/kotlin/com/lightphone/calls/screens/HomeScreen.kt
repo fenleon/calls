@@ -79,6 +79,27 @@ class HomeViewModel : LightViewModel<Unit>() {
     init {
         log.value = WaCallEngine.callLogEntries().sortedBy { it.at }
         names.value = contactNames()
+        // Incoming offers route from engine STATE, not the event stream: a
+        // cold-start offer lands mid-launch (the bot receives it before the
+        // activity is up) and the events StateFlow only replays its LAST
+        // value — often already a later event (history-sync import, the
+        // caller's terminate) — so late-subscribing collectors lost the
+        // offer and the panel never appeared (2026-09-25 live regression).
+        // `pendingOffer` holds the offer for exactly as long as it lives;
+        // collecting it here re-routes it however late this VM subscribes.
+        viewModelScope.launch {
+            WaCallEngine.pendingOffer.collect { offer ->
+                if (offer != null && !callActive.value && !incomingActive.value) {
+                    incomingPeer.value = offer.peer
+                    incomingActive.value = true
+                    // Route through LightGlobalRoute, not a screen
+                    // composition: hidden screens' collectors are
+                    // dead, so only this always-alive VM can make the
+                    // incoming panel appear over ANY screen.
+                    LightGlobalRoute.push { IncomingCallScreen(it, offer.peer) }
+                }
+            }
+        }
         viewModelScope.launch {
             WaCallEngine.events.collect { event ->
                 when (event) {
@@ -92,26 +113,6 @@ class HomeViewModel : LightViewModel<Unit>() {
                     is WaEvent.Paired -> {
                         account.value = WaCallEngine.account()
                     }
-                    is WaEvent.IncomingCall ->
-                        // Stale-replay guard: the engine's StateFlow replays
-                        // its last value to a fresh collector, so app entry
-                        // after a missed call re-delivered a long-dead
-                        // offer's IncomingCall and routed a dead panel (the
-                        // replayed `CallEnded` then flashed "call ended" on
-                        // it, 2026-09-24 LP3). Route only an offer the
-                        // engine still holds — a dead one has been dropped
-                        // (currentCallPeer null or a different call).
-                        if (!callActive.value && !incomingActive.value &&
-                            WaCallEngine.currentCallPeer == event.peer
-                        ) {
-                            incomingPeer.value = event.peer
-                            incomingActive.value = true
-                            // Route through LightGlobalRoute, not a screen
-                            // composition: hidden screens' collectors are
-                            // dead, so only this always-alive VM can make the
-                            // incoming panel appear over ANY screen.
-                            LightGlobalRoute.push { IncomingCallScreen(it, event.peer) }
-                        }
                     is WaEvent.Ringing ->
                         // Outgoing offer out (the dial tap already routed the
                         // panel — this is a no-op then): a no-answer timeout

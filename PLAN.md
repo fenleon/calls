@@ -45,6 +45,11 @@ post-install), or a `componentToRelaunch`-style wake. Battery-stanced: the sync
 FGS already runs — check why the bot was not up (process killed by system?
 FGS not restarted?).
 
+Recovery half RESOLVED (2026-09-25, see §7): when the launch itself catches a
+still-live offer, it now routes — home routes from the engine's `pendingOffer`
+state instead of the event stream, so the mid-launch offer survives the late
+subscription. The FGS-not-restarted-across-reboot half stays open.
+
 ## 3. Volume rocker during a call
 
 Relayed volume keys surface LightOS's ringer-only panel — call
@@ -129,3 +134,23 @@ Note for the uncommitted WIP in the tree: its demo-expiry tail writes
 `_events.value = CallEnded("missed")` directly — switch it to
 `WaCallEngine.publish(...)` (or make it private and route through `publish`)
 so the demo expiry also reaches `liveEvents` collectors.
+
+**Fix-up (2026-09-25, cold-start regression in the original fix):** routing the
+panel from the events stream was fragile in BOTH directions — replay delivers
+stale events (the stuck flash) and, worse for cold starts, a mid-launch offer
+was routinely ALREADY replaced in the StateFlow's last value (history-sync
+imports, the caller's terminate) before home's late-subscribing collector read
+it, so the panel never appeared (LP3 2026-09-25 00:34 live trace). Home now
+routes from `WaCallEngine.pendingOffer` — a `StateFlow<WaEvent.IncomingCall?>`
+that holds the offer for exactly as long as it lives (set in the reducer's
+`IncomingCall` branch, cleared on accept/`CallStarted`, reject, `MissedCall`,
+`CallEnded`, `dropCurrentCall`, and in the fake-call direct-publish paths).
+`IncomingCallScreen` anchors its staleness close on `pendingOffer` (guarded so
+it never pops the active-call screen that replaces it on accept); the
+placement wait, `parkEvents`, pairing QR replay and the active-call screen
+stay on the untouched `events` StateFlow. Emulator evidence
+(`calls-audit-2026-09-24/cold-start/`): demo panel routes (a1); with the
+activity destroyed but the process kept alive by the FGS, a fresh launch
+routes the offer set before the VM existed (a2); with the offer cleared, a
+fresh launch shows clean home (a3); accept → active panel intact (a4),
+hang-up → flash dismisses to home (a5).
