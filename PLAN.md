@@ -67,3 +67,65 @@ video API — SPEC §2/§3.3 corrected 2026-09-23). §1/§2 above land first.
 
 Audit `WaSyncService` + `WaCallService` FGS CPU/wakeups on the LP3 now that the
 relay and ringer run at bootstrap (the standing doze-disabled caveat applies).
+
+## 7. Stuck "call ended" panel (fixed 2026-09-24)
+
+User report (LP3): after missing a call with the app closed/idle, the next app
+entry showed a fullscreen "call ended" panel that never dismissed; only a
+restart cleared it.
+
+**Mechanics verified** (light-sdk `sdk/client`):
+
+- `WaCallEngine.events` is a `StateFlow<WaEvent?>` whose value is set for every
+  event (engine tail + the direct fake/pairing writes) and never cleared after
+  `CallEnded` — every fresh collector instantly replays the last event.
+- `LightGlobalRoute.request` is a process-wide `StateFlow<Request?>` holding the
+  LAST push; `LightActivity` consumes it once (sets it null) on collection
+  (`LightActivity.kt:135-137`). Routes do NOT survive process death —
+  `onCreate` always rebuilds the stack from the initial screen
+  (`LightActivity.kt:126-129`) — but they DO survive app exit while the process
+  lives (`singleTask` activity, stopped-not-destroyed).
+- `goBack()` no-ops when `backStack.size <= 1` (`LightActivity.kt:95`); a
+  routed panel always sits above the root, so the pop itself was never the
+  failing step — the failing step was the stale state that put a dead call's
+  panel + stale `CallEnded` replay in front of the user.
+
+**Failure chain**: offer arrives while the tool is closed (process kept alive
+by the FGS) → home's always-alive VM pushes the panel; the offer then dies and
+`CallEnded` becomes the StateFlow's last value. If the terminal event is lost
+(bridge respawn) or arrives out of sight, a later app entry replays the stale
+`IncomingCall`/`CallEnded` to the fresh collectors: home routes a panel for a
+long-dead offer, and the panel instantly flashes "call ended" from the replay —
+with nothing left to dismiss it from.
+
+**Fix** (commit `b028269`):
+
+- `WaCallEngine` now publishes to a replay-free `liveEvents` `SharedFlow`
+  (replay=0) alongside the StateFlow. Screens that must never act on stale
+  deliveries collect `liveEvents`; consumers that need the replay keep the
+  StateFlow — the 60 s placement wait (`place()` + `parkEvents()`), the
+  pairing screen's QR rotations, and the active-call screen's `CallStarted`
+  replay are untouched.
+- `IncomingCallScreen` collects `liveEvents` and closes if the engine already
+  dropped the offer before the panel subscribed (covers the route→subscription
+  gap the replay used to cover).
+- `HomeViewModel` routes `IncomingCall`/`Ringing`/`CallStarted` only while the
+  engine still holds the call (`currentCallPeer` check) — a stale replay can no
+  longer route a dead panel.
+- Engine-side clearing of the StateFlow was considered and rejected: clearing
+  `_events` after `CallEnded` can conflate the value away before a suspended
+  collector resumes, swallowing the very event `place()`'s 60 s wait and the
+  live panels depend on.
+
+**Repro** (emulator, `calls-audit-2026-09-24/stuck-panel/`): force-stop
+mid-ring → relaunch shows a clean home (no route restoration after process
+death — `03-`/`11-*.xml`); demo call → HOME → re-enter restores the ringing
+panel from the live stack (`06-`, pre-fix; `12-`, post-fix — live offers still
+restore). Post-fix regression run: answer → hang up → flash auto-dismisses to
+home (`08-`/`09-`), re-entry after a dead call is clean (`10-`), decline path
+works (`13-`).
+
+Note for the uncommitted WIP in the tree: its demo-expiry tail writes
+`_events.value = CallEnded("missed")` directly — switch it to
+`WaCallEngine.publish(...)` (or make it private and route through `publish`)
+so the demo expiry also reaches `liveEvents` collectors.
