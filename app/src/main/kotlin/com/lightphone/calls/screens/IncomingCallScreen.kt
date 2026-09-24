@@ -104,8 +104,18 @@ class IncomingCallScreen(
         // always-alive ViewModel via `LightGlobalRoute` (clearToRoot — this
         // panel is replaced by the active-call screen); a caller cancel or
         // expiry arrives as `MissedCall`, never `CallEnded` — close quietly.
+        // Live events only: the `events` StateFlow replays its last value to
+        // a fresh collector — a stale `CallEnded` from a call that died while
+        // the app was closed flashed "call ended" here and never left
+        // (2026-09-24 LP3 report). The live stream has no replay to cover the
+        // route→subscription gap, so an offer that died in it is closed here:
+        // the engine no longer holds the peer.
         LaunchedEffect(Unit) {
-            WaCallEngine.events.collect { event ->
+            if (WaCallEngine.currentCallPeer != peer) {
+                goBack()
+                return@LaunchedEffect
+            }
+            WaCallEngine.liveEvents.collect { event ->
                 when (event) {
                     is WaEvent.MissedCall -> if (event.peer == peer) goBack()
                     is WaEvent.CallEnded -> ended = true

@@ -11,7 +11,9 @@ import com.lightphone.calls.server.bridge.WaVideoFrame
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
@@ -35,6 +37,26 @@ object WaCallEngine : WaListener {
 
     private val _events = MutableStateFlow<WaEvent?>(null)
     val events: StateFlow<WaEvent?> = _events
+
+    /** Replay-free mirror of [events] for screens that must never act on a
+     *  stale delivery. The StateFlow instantly replays its last value to a
+     *  fresh collector — after a missed call that last value is `CallEnded`,
+     *  so the next app entry flashed "call ended" on a panel that had just
+     *  been routed from the replayed `IncomingCall` (2026-09-24 LP3 report:
+     *  the flash then never left). Screens that only react to live events
+     *  subscribe here; consumers that NEED the replay stay on [events] —
+     *  the placement wait (`ActiveCallViewModel.place`, which parks the
+     *  flow first), the pairing screen's QR rotations, and home's re-entry
+     *  resync of a call that is still live. */
+    private val _liveEvents = MutableSharedFlow<WaEvent>(extraBufferCapacity = 64)
+    val liveEvents: SharedFlow<WaEvent> = _liveEvents
+
+    /** Publishes to both surfaces — the StateFlow for replay consumers, the
+     *  shared flow for live-only ones. */
+    private fun publish(event: WaEvent) {
+        _events.value = event
+        _liveEvents.tryEmit(event)
+    }
 
     /** Engine-level failure the UI renders as a small error line (the bridge
      *  process store failed to open, a call connected with the mic FGS start
@@ -277,7 +299,7 @@ object WaCallEngine : WaListener {
         if (fakeCall) {
             Ringer.stop()
             appContext?.let { WaCallService.tryStart(it) }
-            _events.value = WaEvent.CallStarted(callId = "fake")
+            publish(WaEvent.CallStarted(callId = "fake"))
             return
         }
         // CAMERA ungranted (denied in the answer flow, or a server-side race
@@ -381,7 +403,7 @@ object WaCallEngine : WaListener {
             fakeCall = false
             CallTone.playDisconnect()
             appContext?.let { WaCallService.tryStop(it) }
-            _events.value = WaEvent.CallEnded(reason = "ended")
+            publish(WaEvent.CallEnded(reason = "ended"))
             return
         }
         scope.launch {
@@ -651,7 +673,7 @@ object WaCallEngine : WaListener {
             }
             else -> Unit
         }
-        _events.value = event
+        publish(event)
     }
 
     private fun audioLink(): AudioLink {

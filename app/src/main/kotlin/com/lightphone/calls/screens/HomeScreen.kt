@@ -93,7 +93,17 @@ class HomeViewModel : LightViewModel<Unit>() {
                         account.value = WaCallEngine.account()
                     }
                     is WaEvent.IncomingCall ->
-                        if (!callActive.value && !incomingActive.value) {
+                        // Stale-replay guard: the engine's StateFlow replays
+                        // its last value to a fresh collector, so app entry
+                        // after a missed call re-delivered a long-dead
+                        // offer's IncomingCall and routed a dead panel (the
+                        // replayed `CallEnded` then flashed "call ended" on
+                        // it, 2026-09-24 LP3). Route only an offer the
+                        // engine still holds — a dead one has been dropped
+                        // (currentCallPeer null or a different call).
+                        if (!callActive.value && !incomingActive.value &&
+                            WaCallEngine.currentCallPeer == event.peer
+                        ) {
                             incomingPeer.value = event.peer
                             incomingActive.value = true
                             // Route through LightGlobalRoute, not a screen
@@ -105,13 +115,23 @@ class HomeViewModel : LightViewModel<Unit>() {
                     is WaEvent.Ringing ->
                         // Outgoing offer out (the dial tap already routed the
                         // panel — this is a no-op then): a no-answer timeout
-                        // flash lives on the panel itself.
-                        callActive.value = true
+                        // flash lives on the panel itself. Stale-replay
+                        // guard as above: only a call the engine still holds.
+                        if (WaCallEngine.currentCallPeer != null) {
+                            callActive.value = true
+                        }
                     is WaEvent.CallStarted -> {
-                        callActive.value = true
-                        // clearToRoot: an incoming panel may sit on the stack
-                        // below — the answered call's screen replaces it.
-                        pushActive(WaCallEngine.currentCallPeer ?: "call", clearToRoot = true)
+                        // Stale-replay guard: a replayed CallStarted for a
+                        // call the engine already dropped must not route an
+                        // active-call panel on app entry (the engine's own
+                        // ghost guard drops it before audio, the tail still
+                        // publishes it to the flow).
+                        if (WaCallEngine.currentCallPeer != null) {
+                            callActive.value = true
+                            // clearToRoot: an incoming panel may sit on the stack
+                            // below — the answered call's screen replaces it.
+                            pushActive(WaCallEngine.currentCallPeer ?: "call", clearToRoot = true)
+                        }
                     }
                     is WaEvent.CallEnded -> {
                         callActive.value = false
