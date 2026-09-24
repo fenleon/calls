@@ -790,6 +790,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -840,6 +842,8 @@ fun uniffi_wa_bridge_checksum_method_wabridge_send_mic_pcm(
 fun uniffi_wa_bridge_checksum_method_wabridge_send_video_au(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_set_muted(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_set_video_orientation(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_start(
 ): Short
@@ -945,6 +949,8 @@ fun uniffi_wa_bridge_fn_method_wabridge_send_video_au(`ptr`: Pointer,`au`: RustB
 ): Byte
 fun uniffi_wa_bridge_fn_method_wabridge_set_muted(`ptr`: Pointer,`muted`: Byte,
 ): Long
+fun uniffi_wa_bridge_fn_method_wabridge_set_video_orientation(`ptr`: Pointer,`orientation`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_start(`ptr`: Pointer,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_start_video(`ptr`: Pointer,`fps`: Int,
@@ -1137,6 +1143,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_set_muted() != 56408.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_set_video_orientation() != 13562.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_start() != 14634.toShort()) {
@@ -1832,6 +1841,15 @@ public interface WaBridgeInterface {
     suspend fun `setMuted`(`muted`: kotlin.Boolean)
     
     /**
+     * Sets this device's orientation (90° steps 0..3) carried in outbound
+     * `<video>` stanzas. The sensor rotation is what the receiver uses to
+     * rotate the decoded video; the value must be set before/with the video
+     * upgrade so the state-11/4 stanzas carry it. Applies immediately to a
+     * live call and is remembered for the next one.
+     */
+    fun `setVideoOrientation`(`orientation`: kotlin.UByte)
+    
+    /**
      * Opens the SqliteStore session (restoring a previous pairing if one
      * exists), builds and spawns the real whatsapp-rust bot. Returns once
      * the bot is running; connection and pairing proceed on its tasks and
@@ -2325,6 +2343,25 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
         WaException.ErrorHandler,
     )
     }
+
+    
+    /**
+     * Sets this device's orientation (90° steps 0..3) carried in outbound
+     * `<video>` stanzas. The sensor rotation is what the receiver uses to
+     * rotate the decoded video; the value must be set before/with the video
+     * upgrade so the state-11/4 stanzas carry it. Applies immediately to a
+     * live call and is remembered for the next one.
+     */
+    @Throws(WaException::class)override fun `setVideoOrientation`(`orientation`: kotlin.UByte)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(WaException) { _status ->
+    UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_set_video_orientation(
+        it, FfiConverterUByte.lower(`orientation`),_status)
+}
+    }
+    
+    
 
     
     /**

@@ -287,6 +287,10 @@ object WaCallEngine : WaListener {
         val video = withVideo && cameraGranted()
         if (video) {
             videoConsent = true
+            // The camera opens below, but the sensor value is a static
+            // characteristic — signal it BEFORE the accept so the state-4/1
+            // stanzas carry it.
+            runCatching { bridgeOrThrow().setVideoOrientation(videoOrientationSignal()) }
             startVideoEncoding()
         }
         try {
@@ -682,6 +686,22 @@ object WaCallEngine : WaListener {
     @Volatile
     private var peerSurface: Surface? = null
 
+    /** The front camera's `SENSOR_ORIENTATION` in 90° steps, as last reported
+     *  by a live [VideoLink] — fallback for [videoOrientationSignal] when the
+     *  camera-manager read there fails. */
+    @Volatile
+    private var reportedSensorSteps: Int? = null
+
+    /** The `device_orientation` (90° steps 0..3) signaled to the peer on
+     *  outbound `<video>` stanzas, sourced from the front camera's
+     *  `SENSOR_ORIENTATION`. The rotation-direction convention (raw value vs
+     *  its complement `(4 - x) % 4`) is calibrated on-device against a live
+     *  call — flipping it is a one-line change here. */
+    private fun videoOrientationSignal(): UByte {
+        val steps = VideoLink.frontSensorOrientationSteps() ?: reportedSensorSteps ?: 0
+        return steps.mod(4).toUByte()
+    }
+
     /** User-level video actions (the UI toggle / upgrade prompt). All
      *  fire-and-forget on the engine scope; failures surface through
      *  [_error] and the reduced video state. */
@@ -691,6 +711,7 @@ object WaCallEngine : WaListener {
     fun startVideo() {
         scope.launch {
             try {
+                bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
                 bridgeOrThrow().startVideo(videoTier.fps.toUInt())
             } catch (e: Exception) {
                 Log.w(TAG, "startVideo failed: ${e.message}")
@@ -711,6 +732,7 @@ object WaCallEngine : WaListener {
         val token = (_videoState.value as? VideoUiState.UpgradeRequested)?.token ?: return
         scope.launch {
             val ok = runCatching {
+                bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
                 bridgeOrThrow().acceptVideo(token, videoTier.fps.toUInt())
                 bridgeOrThrow().announceVideoEnabled()
             }.onFailure { Log.w(TAG, "acceptVideo failed: ${it.message}") }.isSuccess
@@ -778,6 +800,12 @@ object WaCallEngine : WaListener {
         val link = VideoLink(
             sink = { au -> runCatching { bridge.sendVideoAu(au) }.getOrDefault(false) },
             onLost = { reason -> onVideoEncodeLost(reason) },
+            onSensorOrientation = { steps ->
+                reportedSensorSteps = steps
+                // The live handle is already attached here — keep it in sync
+                // so any outbound stanza from now on carries the value.
+                runCatching { bridge.setVideoOrientation(videoOrientationSignal()) }
+            },
         )
         link.start()
         encodeLink = link

@@ -82,6 +82,11 @@ class VideoLink(
     /** Camera-loss / start-failure callback: the encode half is already torn
      *  down when it fires. */
     private val onLost: (String) -> Unit = {},
+    /** Fired from the encode start path with the front camera's
+     *  `SENSOR_ORIENTATION` in 90° steps (0..3) — the value the engine
+     *  signals to the peer as `device_orientation` on outbound `<video>`
+     *  stanzas. */
+    private val onSensorOrientation: (Int) -> Unit = {},
 ) {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -173,23 +178,25 @@ class VideoLink(
 
         val manager = appContext().getSystemService(CameraManager::class.java)
         val id = frontCameraId(manager)
+        val characteristics = runCatching { manager.getCameraCharacteristics(id) }.getOrNull()
         // Pace the sensor at the tier's fps: with surface input the encoder
         // encodes every frame the camera delivers, so KEY_FRAME_RATE alone
         // doesn't set the output cadence.
-        val fpsRange = runCatching {
-            manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                ?.let { ranges ->
-                    // V1-review carry-over: only a fixed [fps, fps] range
-                    // paces the sensor at the tier's fps — a containing range
-                    // (e.g. [10,30]) lets it drift and mismatches the bridge's
-                    // RTP timestamp stride (`90_000 / fps`). Fail loudly.
-                    ranges.firstOrNull { it.lower == tier.fps && it.upper == tier.fps }
-                }
-        }.getOrNull()
+        val fpsRange = characteristics
+            ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.let { ranges ->
+                // V1-review carry-over: only a fixed [fps, fps] range
+                // paces the sensor at the tier's fps — a containing range
+                // (e.g. [10,30]) lets it drift and mismatches the bridge's
+                // RTP timestamp stride (`90_000 / fps`). Fail loudly.
+                ranges.firstOrNull { it.lower == tier.fps && it.upper == tier.fps }
+            }
             ?: throw IllegalStateException(
                 "camera $id offers no fixed [${tier.fps},${tier.fps}] fps range — refusing to mispace the encode",
             )
+        characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)?.let { degrees ->
+            onSensorOrientation(degrees / 90)
+        }
         Log.i(TAG, "video encode start: ${tier.width}x${tier.height}@${tier.fps} camera=$id fpsRange=$fpsRange")
         runCatching {
             manager.openCamera(id, object : CameraDevice.StateCallback() {
@@ -217,7 +224,7 @@ class VideoLink(
                                 val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                     addTarget(surface)
                                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                                    fpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                                    fpsRange.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
                                 }
                                 s.setRepeatingRequest(request.build(), null, handler)
                             }
@@ -273,14 +280,6 @@ class VideoLink(
         runCatching { dump?.flush(); dump?.close() }
         dump = null
         Log.i(TAG, "video encode stop: $pushedAUs AUs ($keyframeAUs keyframes) pushed")
-    }
-
-    private fun frontCameraId(manager: CameraManager): String {
-        val ids = manager.cameraIdList
-        return ids.firstOrNull { id ->
-            manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
-                CameraCharacteristics.LENS_FACING_FRONT
-        } ?: ids.firstOrNull() ?: throw IllegalStateException("no cameras")
     }
 
     private val encoderCallback = object : MediaCodec.Callback() {
@@ -360,6 +359,27 @@ class VideoLink(
         /** QP ceiling paired with the CBR target — low enough that even a
          *  low-motion scene spends ~the configured bits. */
         private const val QP_MAX = 28
+
+        private fun frontCameraId(manager: CameraManager): String {
+            val ids = manager.cameraIdList
+            return ids.firstOrNull { id ->
+                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_FRONT
+            } ?: ids.firstOrNull() ?: throw IllegalStateException("no cameras")
+        }
+
+        /** The front camera's `SENSOR_ORIENTATION` in 90° steps (0..3), or
+         *  null when no camera resolves. Characteristics are readable without
+         *  the CAMERA grant (only openCamera is gated), so this works before
+         *  any camera open — the engine reads it when signaling an outbound
+         *  `<video>` stanza. */
+        fun frontSensorOrientationSteps(): Int? = runCatching {
+            val manager = WaCallEngine.appContextForVideoLink()
+                .getSystemService(CameraManager::class.java)
+            val id = frontCameraId(manager)
+            manager.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.SENSOR_ORIENTATION)
+        }.getOrNull()?.let { it / 90 }
     }
 }
 

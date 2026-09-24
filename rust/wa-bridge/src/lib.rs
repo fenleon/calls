@@ -383,6 +383,12 @@ pub struct WaBridge {
     /// `terminate`, cleared by the `wait_ended` watcher, cloned for
     /// `set_muted`. Shared so the watcher task can reach it.
     call: Arc<Mutex<Option<CallHandle>>>,
+    /// This device's orientation (90° steps 0..3) carried in outbound
+    /// `<video>` stanzas. Stored bridge-side so a value set before a call
+    /// attaches is in force for the call's first state-11 stanza
+    /// (`attach_call` applies it to the new handle); `set_video_orientation`
+    /// also applies it to a live handle immediately.
+    video_orientation: Arc<std::sync::atomic::AtomicU8>,
     /// The call id whose end has already surfaced to Kotlin. The
     /// `wait_ended` watcher and the mapped Terminate/EndedElsewhere events
     /// both race to report the same end (a peer hangup reaches us as BOTH a
@@ -457,6 +463,7 @@ impl WaBridge {
             vframe_rx: self.vframe_rx.clone(),
             pending_upgrade: self.pending_upgrade.clone(),
             call: self.call.clone(),
+            video_orientation: self.video_orientation.clone(),
             ended_emitted: self.ended_emitted.clone(),
             incoming: self.incoming.clone(),
             outgoing_ringing: self.outgoing_ringing.clone(),
@@ -480,6 +487,7 @@ struct CallCtx {
     vframe_rx: chan::Receiver<VideoFrame>,
     pending_upgrade: PendingUpgrade,
     call: Arc<Mutex<Option<CallHandle>>>,
+    video_orientation: Arc<std::sync::atomic::AtomicU8>,
     ended_emitted: EndedEmitted,
     incoming: Arc<Mutex<Option<IncomingCall>>>,
     outgoing_ringing: OutgoingRinging,
@@ -522,6 +530,13 @@ impl CallCtx {
         while self.vframe_rx.try_recv().is_ok() {}
         // A pending upgrade belongs to the previous call's negotiation.
         *self.pending_upgrade.lock().unwrap() = None;
+        // The orientation may have been set before the call attached (camera
+        // opened during the consent flow) — put the stored value in force so
+        // the call's first outbound `<video state=11>` stanza carries it.
+        handle.set_device_orientation(
+            self.video_orientation
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         *self.call.lock().unwrap() = Some(handle.clone());
         let events = self.events.clone();
         let call_slot = self.call.clone();
@@ -638,6 +653,7 @@ impl WaBridge {
             vframe_rx,
             pending_upgrade: Arc::new(Mutex::new(None)),
             call: Arc::new(Mutex::new(None)),
+            video_orientation: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             ended_emitted: Arc::new(Mutex::new(None)),
             incoming: Arc::new(Mutex::new(None)),
             outgoing_ringing: Arc::new(Mutex::new(None)),
@@ -1317,6 +1333,20 @@ impl WaBridge {
             .clone()
             .ok_or(WaError::NoActiveCall)?;
         handle.set_muted(muted);
+        Ok(())
+    }
+
+    /// Sets this device's orientation (90° steps 0..3) carried in outbound
+    /// `<video>` stanzas. The sensor rotation is what the receiver uses to
+    /// rotate the decoded video; the value must be set before/with the video
+    /// upgrade so the state-11/4 stanzas carry it. Applies immediately to a
+    /// live call and is remembered for the next one.
+    pub fn set_video_orientation(&self, orientation: u8) -> Result<(), WaError> {
+        self.video_orientation
+            .store(orientation % 4, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.call.lock().unwrap().as_ref() {
+            handle.set_device_orientation(orientation);
+        }
         Ok(())
     }
 

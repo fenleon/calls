@@ -192,3 +192,27 @@ ffprobe stream checks; upgrade/downgrade both directions; clean teardown.
    events arrive on Rust threads like existing ones (main-dispatcher hop unchanged).
 5. **Library churn** — accept_video signature moved twice in 2026; pin the fork
    rev, re-read the guide warnings on bump (SPEC §2 rule).
+
+## Orientation fix (2026-09-24, live-call finding)
+
+**Root cause:** LP3→emulator video rendered horizontally on the receiver — the
+sender encoded sensor-native frames (front camera is natively landscape) while
+the vendored library hardcoded `device_orientation: Some(0)` in every outbound
+`<video>` stanza (no shell API to signal it). Receiver was already correct.
+
+**Patch (fork, `call-log-sync`):** `VideoShared` gains an `AtomicU8
+device_orientation`; `CallHandle::set_device_orientation()`/`device_orientation()`
+expose it; the outbound-state sites in `voip/facade.rs` (state 1, and the
+upgrade closure — states 11/4) send `Some(self.device_orientation())`. The
+state-6 Stopped stanza and `handlers/call.rs` decline paths stay hardcoded 0.
+**Bridge:** `WaBridge.set_video_orientation(u8)` stores the value (AtomicU8,
+default 0), applies it to the live handle, and `attach_call` applies it to a
+new handle (pre-call settings in force for the first state-11 stanza).
+**Sensor source:** `VideoLink` reports `SENSOR_ORIENTATION / 90` (0..3) at
+encode start (`onSensorOrientation`); `frontSensorOrientationSteps()` reads
+the same characteristic without a camera open (not CAMERA-gated);
+`WaCallEngine.videoOrientationSignal()` computes the signaled value, pushed
+before `startVideo`/`acceptVideo`/`acceptCall` and on every camera report.
+**Convention calibration:** raw sensor value vs complement `(4 - x) % 4` is
+calibrated on-device in the live retest — the computation lives only in
+`videoOrientationSignal()`, so flipping it is a one-line change.
