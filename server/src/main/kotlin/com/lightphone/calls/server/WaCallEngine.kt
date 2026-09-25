@@ -35,6 +35,11 @@ sealed interface VideoUiState {
 object WaCallEngine : WaListener {
     private const val TAG = "WaCallEngine"
 
+    /** Debounce for the dynamic rotation re-announce (§V4): collapses the
+     *  `onDisplayChanged` burst a physical rotation produces into one
+     *  `<video state=1>`. */
+    private const val ROTATION_RESIGNAL_DEBOUNCE_MS = 300L
+
     private val _events = MutableStateFlow<WaEvent?>(null)
     val events: StateFlow<WaEvent?> = _events
 
@@ -745,19 +750,60 @@ object WaCallEngine : WaListener {
     @Volatile
     private var reportedSensorSteps: Int? = null
 
-    /** The signaled-orientation mapping: the front sensor's 90° steps as-is.
-     *  CALIBRATION (live-call retest pending): if the peer's video comes back
-     *  180° off (upside-down), the inverse convention applies — change the
-     *  body to `(4 - front) % 4` here; nothing else moves. */
-    private fun signaledOrientationSteps(front: Int): UByte = front.mod(4).toUByte()
-
     /** The `device_orientation` (90° steps 0..3) signaled to the peer on
-     *  outbound `<video>` stanzas: the front camera's `SENSOR_ORIENTATION`
-     *  read statically (no camera open, not CAMERA-gated), so it is known
-     *  before any stanza goes out; the camera report is only a fallback. */
-    private fun videoOrientationSignal(): UByte {
+     *  outbound `<video>` stanzas: the composition of the front camera's
+     *  `SENSOR_ORIENTATION` and the device's current UI rotation, computed
+     *  in one place ([signaledOrientationSteps]). */
+    private fun videoOrientationSignal(): UByte = signaledOrientationSteps()
+
+    /** The signaled-orientation composition — the ONLY place the orientation
+     *  math lives.
+     *
+     *  (a) Portrait base: `front`, the front sensor's raw 90° steps.
+     *      CALIBRATION open: if the live retest shows the peer's video 180°
+     *      off (upside-down), the inverse convention applies to the base —
+     *      `(4 - front) % 4`.
+     *  (b) Composition assumption: the encoded frames rotate with the device
+     *      (surface input; the sensor is mounted relative to the natural
+     *      portrait orientation), so a UI rotation of `ui` steps shifts the
+     *      correction the receiver needs by the same `ui` steps —
+     *      `(front + ui) % 4`.
+     *  (c) BOTH the base (raw vs inverse) and the composition sign
+     *      (`+ ui` vs `- ui`) are verified in the next live retest — expect
+     *      exactly one flip; nothing outside this function moves. */
+    private fun signaledOrientationSteps(uiRotationSteps: Int = 0): UByte {
         val front = VideoLink.frontSensorOrientationSteps() ?: reportedSensorSteps ?: 0
-        return signaledOrientationSteps(front)
+        return (front + uiRotationSteps).mod(4).toUByte()
+    }
+
+    /** The orientation last pushed to the bridge (dedupe for the dynamic
+     *  re-announce — `onDisplayChanged` storms and portrait round-trips
+     *  must not re-send the same stanza). */
+    @Volatile
+    private var lastSignaledOrientation: UByte? = null
+
+    /** Pending debounced re-announce for a mid-call rotation. */
+    private var rotationResignalJob: kotlinx.coroutines.Job? = null
+
+    /** Dynamic mid-call rotation: while OUR video direction is On, a device
+     *  rotation re-signals the composed orientation and re-announces it (a
+     *  fresh `<video state=1>` — the receiving engine re-stamps the peer
+     *  orientation per node). Debounced ~300 ms; failures are logged and
+     *  dropped — no retry loops (battery rule). */
+    private fun onUiRotationReported(uiRotationSteps: Int) {
+        if (_videoState.value !is VideoUiState.On) return
+        val signal = signaledOrientationSteps(uiRotationSteps)
+        if (signal == lastSignaledOrientation) return
+        rotationResignalJob?.cancel()
+        rotationResignalJob = scope.launch {
+            kotlinx.coroutines.delay(ROTATION_RESIGNAL_DEBOUNCE_MS)
+            lastSignaledOrientation = signal
+            val bridge = bridge ?: return@launch
+            runCatching {
+                bridge.setVideoOrientation(signal)
+                bridge.announceVideoEnabled()
+            }.onFailure { Log.w(TAG, "rotation re-signal failed: ${it.message}") }
+        }
     }
 
     /** User-level video actions (the UI toggle / upgrade prompt). All
@@ -864,6 +910,7 @@ object WaCallEngine : WaListener {
                 // so any outbound stanza from now on carries the value.
                 runCatching { bridge.setVideoOrientation(videoOrientationSignal()) }
             },
+            onUiRotation = { steps -> onUiRotationReported(steps) },
         )
         link.start()
         encodeLink = link
@@ -883,6 +930,8 @@ object WaCallEngine : WaListener {
     }
 
     private fun stopVideoEncoding() {
+        rotationResignalJob?.cancel()
+        rotationResignalJob = null
         encodeLink?.let { link -> encodeLink = null; link.stop() }
     }
 

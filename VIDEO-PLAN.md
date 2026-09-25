@@ -161,6 +161,9 @@ mechanics — see the V3 report):
   unchanged — watch playout trim interaction). If the orientation is learned
   late, the peer keeps the stale value until the next `<video>` stanza — the
   static read closes the practical case.
+- Dynamic mid-call rotation (re-announce on device rotation) — verify live:
+  rotate the LP3 mid-video-call; peer picture should rotate; calibration
+  (raw vs inverse) decided same retest.
 - Orientation residual (from-start callee): the wacore `video_accept_node`/
   `video_preaccept_node` (`<accept>`-child `<video>`) and `video_offer_node`
   still hardcode `device_orientation="0"` — a video-from-start call needs the

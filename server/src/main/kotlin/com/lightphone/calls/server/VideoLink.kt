@@ -7,6 +7,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -87,6 +88,12 @@ class VideoLink(
      *  signals to the peer as `device_orientation` on outbound `<video>`
      *  stanzas. */
     private val onSensorOrientation: (Int) -> Unit = {},
+    /** Fired when the device's UI rotation changes while the encode half is
+     *  up, as 90° steps (0..3, `Surface.ROTATION_*` ordinals) — the dynamic
+     *  half of the orientation signal. Backed by a
+     *  `DisplayManager.DisplayListener` (see [startOnThread] for why not an
+     *  `OrientationEventListener`). */
+    private val onUiRotation: (Int) -> Unit = {},
 ) {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -96,6 +103,14 @@ class VideoLink(
     private var inputSurface: Surface? = null
     private var dump: OutputStream? = null
     @Volatile private var running = false
+
+    /** Live rotation listener (registration pairs with [teardownOnThread]). */
+    private var displayListener: DisplayManager.DisplayListener? = null
+    private var displayManager: DisplayManager? = null
+
+    /** Last UI rotation reported (dedupe — `onDisplayChanged` also fires for
+     *  non-rotation display changes like brightness). */
+    private var lastReportedUiRotation = -1
 
     /** SPS+PPS from the encoder's `INFO_OUTPUT_FORMAT_CHANGED`
      *  (BUFFER_FLAG_CODEC_CONFIG bytes) — prepended to every keyframe AU. */
@@ -112,6 +127,7 @@ class VideoLink(
         csd = null
         pushedAUs = 0
         keyframeAUs = 0
+        lastReportedUiRotation = -1
         dump = dumpFile?.let { FileOutputStream(it) }
         thread = HandlerThread("VideoLink-encode", Process.THREAD_PRIORITY_FOREGROUND).apply { start() }
         handler = Handler(thread!!.looper)
@@ -197,6 +213,7 @@ class VideoLink(
         characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)?.let { degrees ->
             onSensorOrientation(degrees / 90)
         }
+        registerRotationListener()
         Log.i(TAG, "video encode start: ${tier.width}x${tier.height}@${tier.fps} camera=$id fpsRange=$fpsRange")
         runCatching {
             manager.openCamera(id, object : CameraDevice.StateCallback() {
@@ -267,7 +284,50 @@ class VideoLink(
         onLost(reason)
     }
 
+    /** Tracks the device's UI rotation while the encode half is up. A
+     *  `DisplayManager.DisplayListener` (not an `OrientationEventListener`):
+     *  the orientation signal composes with the UI rotation
+     *  (`display.rotation`), which only changes when the system actually
+     *  rotates the display — the listener fires exactly then, is
+     *  event-driven (no sensor held hot, battery rule), and needs no
+     *  tilt thresholding. An `OrientationEventListener` streams raw
+     *  accelerometer angles continuously regardless of whether the UI
+     *  (and thus the composition basis) changed.
+     *  LightOS emulator has no rotation path — verification is on-device. */
+    private fun registerRotationListener() {
+        runCatching {
+            val dm = appContext().getSystemService(DisplayManager::class.java)
+            val listener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(displayId: Int) = Unit
+                override fun onDisplayRemoved(displayId: Int) = Unit
+                override fun onDisplayChanged(displayId: Int) {
+                    val display = dm.getDisplay(displayId) ?: return
+                    val steps = when (display.rotation) {
+                        Surface.ROTATION_90 -> 1
+                        Surface.ROTATION_180 -> 2
+                        Surface.ROTATION_270 -> 3
+                        else -> 0
+                    }
+                    if (steps != lastReportedUiRotation) {
+                        lastReportedUiRotation = steps
+                        onUiRotation(steps)
+                    }
+                }
+            }
+            dm.registerDisplayListener(listener, handler)
+            displayManager = dm
+            displayListener = listener
+        }.onFailure { Log.w(TAG, "rotation listener registration failed: ${it.message}") }
+    }
+
+    private fun unregisterRotationListener() {
+        runCatching { displayListener?.let { displayManager?.unregisterDisplayListener(it) } }
+        displayListener = null
+        displayManager = null
+    }
+
     private fun teardownOnThread() {
+        unregisterRotationListener()
         runCatching { session?.close() }
         session = null
         runCatching { camera?.close() }
