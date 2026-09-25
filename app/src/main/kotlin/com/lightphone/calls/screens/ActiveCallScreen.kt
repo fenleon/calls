@@ -1,9 +1,9 @@
 package com.lightphone.calls.screens
 
 import android.Manifest
+import android.graphics.SurfaceTexture
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -181,7 +181,7 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     }
     fun declineVideo() = WaCallEngine.declineVideo()
 
-    /** The peer-video SurfaceView's lifecycle → the engine's decode half. */
+    /** The peer-video TextureView's lifecycle → the engine's decode half. */
     fun attachSurface(surface: Surface?) = WaCallEngine.attachPeerSurface(surface)
 
     fun end() = WaCallEngine.endCall()
@@ -257,16 +257,16 @@ class ActiveCallScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                // Peer video, full-bleed: the SurfaceView sits behind the
-                // window's content (it punches its hole in the hierarchy), so
-                // the monochrome overlay — status line, peer name, controls —
-                // stays drawn above it. Composed for the whole call and
-                // attached once: the framework does not reliably hand a fresh
-                // surface to a SurfaceView re-created in the same activity
-                // (observed on the emulator), so a video off→on toggle must
-                // not rebuild the view — it only flips the cover below. The
-                // decode half starts when video turns On (or CallStarted with
-                // video) and this surface is attached.
+                // Peer video, full-bleed. TextureView, not SurfaceView: the
+                // peer's rotation is applied via this view's graphicsLayer,
+                // and a SurfaceView's SurfaceFlinger-composited layer does
+                // not honor render-node/view rotation (position/size sync
+                // only) — the rotation silently did nothing (LP3↔emulator
+                // retest 2026-09-25); TextureView draws in the view
+                // hierarchy, so the rotation applies. Composed for the whole
+                // call and attached once; the decode half starts when video
+                // turns On (or CallStarted with video) and this surface is
+                // attached.
                 AndroidView(
                     modifier = Modifier
                         .fillMaxSize()
@@ -288,28 +288,34 @@ class ActiveCallScreen(
                             }
                         },
                     factory = { context ->
-                        SurfaceView(context).apply {
-                            holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    viewModel.attachSurface(holder.surface)
+                        TextureView(context).apply {
+                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(
+                                    surface: SurfaceTexture,
+                                    width: Int,
+                                    height: Int,
+                                ) {
+                                    viewModel.attachSurface(Surface(surface))
                                 }
 
-                                override fun surfaceChanged(
-                                    holder: SurfaceHolder,
-                                    format: Int,
+                                override fun onSurfaceTextureSizeChanged(
+                                    surface: SurfaceTexture,
                                     width: Int,
                                     height: Int,
                                 ) = Unit
 
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                                     viewModel.attachSurface(null)
+                                    return true // release the texture with the view
                                 }
-                            })
+
+                                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+                            }
                         }
                     },
                 )
-                // Cover the punched-out video area while no video shows —
-                // otherwise the dead surface renders as a black rectangle.
+                // Cover the video area while no video shows — a TextureView
+                // keeps showing its last decoded frame otherwise.
                 if (!videoOn) {
                     Box(
                         modifier = Modifier

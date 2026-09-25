@@ -1,8 +1,8 @@
 package com.lightphone.calls.screens
 
+import android.graphics.SurfaceTexture
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,17 +12,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.lightphone.calls.server.WaCallEngine
-import kotlinx.coroutines.delay
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -39,11 +34,11 @@ import com.thelightphone.sdk.ui.gridUnitsAsDp
 class VideoDecodeTestViewModel : LightViewModel<Unit>() {
     val note = WaCallEngine.exerciseNote
 
-    /** Guards the attach fallback: the surface is handed to the engine once
-     *  (surfaceCreated or the AndroidView update pass) and dropped once. */
+    /** Guards the attach: the surface is handed to the engine once per
+     *  texture lifetime (available or the DisposableEffect dispose). */
     private var attached = false
 
-    /** The test screen's SurfaceView lifecycle → the diagnostics decode
+    /** The test screen's TextureView lifecycle → the diagnostics decode
      *  exercise (see [WaCallEngine.startDecodeExercise]). */
     fun attach(surface: Surface) {
         if (attached) return
@@ -59,7 +54,7 @@ class VideoDecodeTestViewModel : LightViewModel<Unit>() {
 
 /** Diagnostics only (dev aid, like the encoder exercise): replays the
  *  encoder test's archived AU capture through the real decode half into a
- *  SurfaceView. No call, no traffic — the stream is a local file. */
+ *  TextureView. No call, no traffic — the stream is a local file. */
 class VideoDecodeTestScreen(
     sealedActivity: SealedLightActivity,
 ) : LightScreen<Unit, VideoDecodeTestViewModel>(sealedActivity) {
@@ -74,21 +69,9 @@ class VideoDecodeTestScreen(
         val themeColors by LightThemeController.colors.collectAsState()
         val note by viewModel.note.collectAsState()
 
-        // Leaving the screen releases the decode exercise and its surface.
+        // Leaving the screen releases the decode exercise and its texture.
         DisposableEffect(Unit) {
             onDispose { viewModel.detach() }
-        }
-
-        // A re-entered screen can miss `surfaceCreated` (the view re-attaches
-        // to a window whose surface already exists) — poll for a valid
-        // surface and hand it over; [VideoDecodeTestViewModel.attach] runs
-        // once per surface lifetime.
-        var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
-        LaunchedEffect(surfaceView) {
-            while (surfaceView != null) {
-                surfaceView?.holder?.surface?.takeIf { it.isValid }?.let { viewModel.attach(it) }
-                delay(500)
-            }
         }
 
         LightTheme(colors = themeColors) {
@@ -97,27 +80,35 @@ class VideoDecodeTestScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // TextureView, matching the call screen: its listener fires
+                // reliably on re-entry (the old SurfaceView's did not), so
+                // no poll fallback is needed.
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { context ->
-                        SurfaceView(context).apply {
-                            holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    viewModel.attach(holder.surface)
+                        TextureView(context).apply {
+                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(
+                                    surface: SurfaceTexture,
+                                    width: Int,
+                                    height: Int,
+                                ) {
+                                    viewModel.attach(Surface(surface))
                                 }
 
-                                override fun surfaceChanged(
-                                    holder: SurfaceHolder,
-                                    format: Int,
+                                override fun onSurfaceTextureSizeChanged(
+                                    surface: SurfaceTexture,
                                     width: Int,
                                     height: Int,
                                 ) = Unit
 
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                                     viewModel.detach()
+                                    return true // release the texture with the view
                                 }
-                            })
-                            surfaceView = this
+
+                                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+                            }
                         }
                     },
                 )
