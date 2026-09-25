@@ -154,3 +154,57 @@ activity destroyed but the process kept alive by the FGS, a fresh launch
 routes the offer set before the VM existed (a2); with the offer cleared, a
 fresh launch shows clean home (a3); accept → active panel intact (a4),
 hang-up → flash dismisses to home (a5).
+
+## 8. M3 video — live-call feedback (2026-09-25, LP3 ↔ official WhatsApp)
+
+Working as of this session: signaling correct both directions (LP3 signals 3 = front
+sensor 270; raw base confirmed — the official device renders the LP3's stream upright);
+receiver rotation now visually applies (TextureView, def3119); cold-start incoming
+routing works when the bot is up. Open items below, ordered roughly by severity.
+
+1. **Fresh install: no incoming call at all.** Before first app open post-install, an
+   incoming call is missed; opening the app did not surface it either. Hypotheses:
+   WaSyncService not started on fresh install (no POST_INSTALL trigger — §2 family);
+   and/or the offer died before the first WS connect finished (bot up but not yet
+   connected when the caller gave up). Needs: install-event receiver or FGS-start on
+   update, plus log the WS-connect-ready timestamp vs offer arrival.
+2. *(renumbered from §3 below — see video-from-start)*
+3. **Video-from-start calls broken toward official.** Official initiates a video call
+   → LP3 doesn't receive it as a video call; and toggling video on the LP3 in that
+   call returns "video failed". Suspect `VideoNotOffered` handling + the incoming
+   `is_video` accept path (bridge `accept_call(with_video)` + builder `.video(...)`)
+   never exercised against a real official offer — unit-shaped, never live-tested.
+   Note 9e5a342's residual: wacore `video_offer_node`/`video_accept_node` still
+   hardcode device_orientation 0 (video-from-start signaling) — relevant here.
+4. **Camera off→on toggle never re-establishes.** stop→start on the encode link:
+   camera/encoder released on stop but the reopen path doesn't produce frames (LP3
+   picture freezes, peer gets no video). V1's stop-race guards (`running` set
+   synchronously) may be blocking the second start; or Camera2 reopen fails silently.
+   Needs a toggle-cycle test on the emulator + fix.
+5. **Rotation: three of four directions reorientate; clockwise doesn't.** Rotating the
+   official device clockwise produced no reorientation on the LP3 (the 0→1 signal
+   change DID arrive in the 11:09 capture, so the signal works — suspect the receiver
+   composition `(front + ui)` mapping: one quadrant maps to the same value, or the
+   re-announce debounce eats it). Also unconfirmed whether rotating the LP3 itself
+   updates the official device. Calibrate the full 4×4 matrix (both devices' signals
+   are in the captures) and fix the composition.
+6. **Aspect ratio: squash/stretch instead of crop.** The graphicsLayer full-bleed
+   scale stretches odd-step rotations; even steps stretch 4:3 → 1080×1240. Fix:
+   aspect-preserving scale = max(target.w/src.w, target.h/src.h) with center crop
+   (compute from the decoded size + rotation), on both the video surface and the
+   diagnostics screen.
+7. **Low FPS when the mic is on.** LP3's outgoing feed drops frames with mic active,
+   perfect with mic off. Suspects: VOICE_COMMUNICATION HAL AEC load vs encoder on the
+   G99, thread priority contention (AudioRecord URGENT_AUDIO vs camera/encoder
+   handler), or shared HAL/camera conflict. Measure with the media_stats counters +
+   `OutboundMediaDropped` while toggling mic.
+8. **Our-initiated video never sends.** When the OTHER device initiates the upgrade,
+   our video flows; when the LP3 enables video (outgoing upgrade via `startVideo`) or
+   accepts a video-from-start call, our encoder never starts (peer gets no video).
+   Points at the `videoConsent` gating: `acceptVideo`/`startVideo` set it and start
+   the encode — but the real-flow entry points (post-state-11 accept, video-from-start
+   answer) evidently don't reach the encode start. Trace `videoConsent` through the
+   live flow with logs; the V2 consent fix overcorrected for these paths.
+
+Next session: start at 8→3 (both are consent/accept-path bugs, likely one root),
+then 4, then 5+6 (receiver rendering), then 7 (perf), then 1 (fresh-install FGS).
