@@ -745,14 +745,19 @@ object WaCallEngine : WaListener {
     @Volatile
     private var reportedSensorSteps: Int? = null
 
+    /** The signaled-orientation mapping: the front sensor's 90° steps as-is.
+     *  CALIBRATION (live-call retest pending): if the peer's video comes back
+     *  180° off (upside-down), the inverse convention applies — change the
+     *  body to `(4 - front) % 4` here; nothing else moves. */
+    private fun signaledOrientationSteps(front: Int): UByte = front.mod(4).toUByte()
+
     /** The `device_orientation` (90° steps 0..3) signaled to the peer on
-     *  outbound `<video>` stanzas, sourced from the front camera's
-     *  `SENSOR_ORIENTATION`. The rotation-direction convention (raw value vs
-     *  its complement `(4 - x) % 4`) is calibrated on-device against a live
-     *  call — flipping it is a one-line change here. */
+     *  outbound `<video>` stanzas: the front camera's `SENSOR_ORIENTATION`
+     *  read statically (no camera open, not CAMERA-gated), so it is known
+     *  before any stanza goes out; the camera report is only a fallback. */
     private fun videoOrientationSignal(): UByte {
-        val steps = VideoLink.frontSensorOrientationSteps() ?: reportedSensorSteps ?: 0
-        return steps.mod(4).toUByte()
+        val front = VideoLink.frontSensorOrientationSteps() ?: reportedSensorSteps ?: 0
+        return signaledOrientationSteps(front)
     }
 
     /** User-level video actions (the UI toggle / upgrade prompt). All

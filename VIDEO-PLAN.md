@@ -158,7 +158,14 @@ mechanics — see the V3 report):
 - [ ] glare on-device: cancel during a pending video upgrade (`EnableAwaitingAccept`) terminates cleanly (no orphaned video signaling, flags reset)
 
 - Orientation convention verified vs a real call; lipsync sanity (audio path
-  unchanged — watch playout trim interaction).
+  unchanged — watch playout trim interaction). If the orientation is learned
+  late, the peer keeps the stale value until the next `<video>` stanza — the
+  static read closes the practical case.
+- Orientation residual (from-start callee): the wacore `video_accept_node`/
+  `video_preaccept_node` (`<accept>`-child `<video>`) and `video_offer_node`
+  still hardcode `device_orientation="0"` — a video-from-start call needs the
+  same plumbing through `build_accept`/`build_offer` params; the upgrade flow
+  is fully wired (facade states 1/11/4 + handler answer/announce sites).
 - Confirm the peer's client exits its upgrade-wait cleanly after our
   stop-mapped decline (SPEC §3.3: prompt-decline sends VideoState 6, not 5).
 - Thermal + battery: 30-min 480p15 video soak on the LP3, audit-dir convention
@@ -204,7 +211,13 @@ the vendored library hardcoded `device_orientation: Some(0)` in every outbound
 device_orientation`; `CallHandle::set_device_orientation()`/`device_orientation()`
 expose it; the outbound-state sites in `voip/facade.rs` (state 1, and the
 upgrade closure — states 11/4) send `Some(self.device_orientation())`. The
-state-6 Stopped stanza and `handlers/call.rs` decline paths stay hardcoded 0.
+state-6 Stopped stanza stays hardcoded 0. **Follow-up (2026-09-25, retest):**
+the fatal 0 came from the signaling handler's own sends — the initiator's
+post-accept `Enabled` and the concurrent-upgrade `UpgradeAccept`/`Enabled`
+answer (`handlers/call.rs`) — which never read the cell; they now read
+`registry.device_orientation()` (the facade shares `VideoShared`'s cell with
+the registry at registration). The from-start-callee `<accept>`/`<offer>`
+video nodes in wacore still carry 0 — see the V4 residual note.
 **Bridge:** `WaBridge.set_video_orientation(u8)` stores the value (AtomicU8,
 default 0), applies it to the live handle, and `attach_call` applies it to a
 new handle (pre-call settings in force for the first state-11 stanza).
