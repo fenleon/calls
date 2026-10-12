@@ -1,0 +1,22 @@
+[tool]
+id = "com.lightphone.calls"
+label = "Calls"
+versionCode = 2
+versionName = "0.2.0"
+# Single-APK build (the Chats/Audiobooks pattern): the tool hosts its own
+# LightSdkService (embedded :server library with the WhatsApp WebSocket +
+# VoIP bridge) and binds to itself — serverPackage is the tool's own id, so
+# there is no separate companion APK to install. RECORD_AUDIO and CAMERA are
+# requested at runtime through that service's GetPermission flow.
+permissions = [
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.WAKE_LOCK",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.CAMERA",
+]
+# FGS + boot-restart permissions the server needs are in
+# server/src/main/AndroidManifest.xml (not toml-allowlisted).
+serverPackage = "com.lightphone.calls"
+orientation = "portrait"
