@@ -1,0 +1,402 @@
+From bb8481ed28790b5249ca0114aa8b6d20a88c3f6c Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:18:28 +0200
+Subject: [PATCH] voip: keep the media transport alive across a transient
+ signaling reconnect
+
+The run loop's disconnect cleanup (cleanup_connection_state_inner) unconditionally
+aborted every in-flight call, so a ~1 s signaling-WS blip closed the per-call
+media relay socket (net_conn) while the loop was about to reconnect under it.
+Gate the voip teardown (abort_all + drain_pending_outgoing_on_disconnect) on the
+disconnect being terminal: unexpected read-loop exit AND is_running AND
+enable_auto_reconnect. Expected exits (reconnect()/reconnect_immediately(),
+unused mid-call by wa-bridge) and every terminal path keep the reaping contract.
+Also fix the two stale CallAction::Offer test initializers that broke the
+--features voip lib-test compile, and the stale abort_all doc comment.
+---
+ src/client/lifecycle.rs     |  94 +++++++++++++++---
+ src/voip/facade.rs          | 183 +++++++++++++++++++++++++++++++++++-
+ wacore/src/voip/registry.rs |   4 +-
+ 3 files changed, 265 insertions(+), 16 deletions(-)
+
+diff --git a/src/client/lifecycle.rs b/src/client/lifecycle.rs
+index 0a8c9fad..2e7208f2 100644
+--- a/src/client/lifecycle.rs
++++ b/src/client/lifecycle.rs
+@@ -626,7 +626,16 @@ impl Client {
+                     }
+                 };
+ 
+-                self.cleanup_connection_state().await;
++                // The voip teardown inside cleanup is gated on this classification: a genuine
++                // transport blip (unexpected exit, still running, auto-reconnect on) keeps
++                // in-flight calls alive — the media relay socket is per-call and independent of
++                // the signaling WS, and the loop below reconnects under it. Expected exits
++                // (`reconnect()` / `reconnect_immediately()` — conceptually transient too, but
++                // wa-bridge never calls them mid-call) and every terminal path keep today's
++                // reaping contract; see `cleanup_connection_state_on_transport_loss`.
++                let unexpected = unexpected_disconnect.is_some();
++                self.cleanup_connection_state_on_transport_loss(unexpected)
++                    .await;
+ 
+                 // Dispatch after cleanup so handlers see cleared connection state.
+                 if let Some(reason) = unexpected_disconnect {
+@@ -1049,7 +1058,41 @@ impl Client {
+     )]
+     #[cfg(not(feature = "client-lifecycle"))]
+     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+-        self.cleanup_connection_state_inner().await;
++        self.cleanup_connection_state_with_voip_policy(false).await;
++    }
++
++    /// The run loop's cleanup variant: classifies the read-loop exit and skips the voip teardown
++    /// on a transient transport blip. See
++    /// [`cleanup_connection_state_with_voip_policy`](Self::cleanup_connection_state_with_voip_policy).
++    ///
++    /// Classification (all three terms required — Task 1 findings):
++    /// - `unexpected_disconnect`: `reconnect()`/`reconnect_immediately()` funnel here classified
++    ///   `Expected` → `false`. They are conceptually transient, but wa-bridge never calls them
++    ///   mid-call, so their conservative teardown contract is preserved.
++    /// - `is_running`: false once `Client::disconnect()` ran (or during shutdown), making that
++    ///   path terminal.
++    /// - `enable_auto_reconnect`: an unexpected exit with reconnect disabled reaches this cleanup
++    ///   with `is_running` still true (the loop breaks only after cleanup); without this term the
++    ///   terminal exit would be misclassified transient and leak the call's registry entry and
++    ///   relay socket past a dead signaling session.
++    #[cfg(not(feature = "client-lifecycle"))]
++    pub(crate) async fn cleanup_connection_state_on_transport_loss(
++        self: &Arc<Self>,
++        unexpected_disconnect: bool,
++    ) {
++        let keep_voip_calls = unexpected_disconnect
++            && self.is_running.load(Ordering::Relaxed)
++            && self.enable_auto_reconnect.load(Ordering::Relaxed);
++        self.cleanup_connection_state_with_voip_policy(keep_voip_calls)
++            .await;
++    }
++
++    #[cfg(not(feature = "client-lifecycle"))]
++    pub(crate) async fn cleanup_connection_state_with_voip_policy(
++        self: &Arc<Self>,
++        keep_voip_calls: bool,
++    ) {
++        self.cleanup_connection_state_inner(keep_voip_calls).await;
+         self.clear_connection_scoped_pair_code().await;
+     }
+ 
+@@ -1072,8 +1115,30 @@ impl Client {
+     )]
+     #[cfg(feature = "client-lifecycle")]
+     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
++        self.cleanup_connection_state_with_voip_policy(false).await;
++    }
++
++    /// Run-loop variant; see the `#[cfg(not(feature = "client-lifecycle"))]` twin for the
++    /// classification rationale.
++    #[cfg(feature = "client-lifecycle")]
++    pub(crate) async fn cleanup_connection_state_on_transport_loss(
++        self: &Arc<Self>,
++        unexpected_disconnect: bool,
++    ) {
++        let keep_voip_calls = unexpected_disconnect
++            && self.is_running.load(Ordering::Relaxed)
++            && self.enable_auto_reconnect.load(Ordering::Relaxed);
++        self.cleanup_connection_state_with_voip_policy(keep_voip_calls)
++            .await;
++    }
++
++    #[cfg(feature = "client-lifecycle")]
++    pub(crate) async fn cleanup_connection_state_with_voip_policy(
++        self: &Arc<Self>,
++        keep_voip_calls: bool,
++    ) {
+         if self.lifecycle.is_none() {
+-            self.cleanup_connection_state_inner().await;
++            self.cleanup_connection_state_inner(keep_voip_calls).await;
+             self.clear_connection_scoped_pair_code().await;
+             return;
+         }
+@@ -1083,9 +1148,11 @@ impl Client {
+         let client = Arc::clone(self);
+         self.runtime
+             .spawn(Box::pin(async move {
+-                let result = std::panic::AssertUnwindSafe(client.cleanup_connection_state_inner())
+-                    .catch_unwind()
+-                    .await;
++                let result = std::panic::AssertUnwindSafe(
++                    client.cleanup_connection_state_inner(keep_voip_calls),
++                )
++                .catch_unwind()
++                .await;
+                 let _ = completed.send(result);
+             }))
+             .detach();
+@@ -1097,7 +1164,7 @@ impl Client {
+         self.clear_connection_scoped_pair_code().await;
+     }
+ 
+-    async fn cleanup_connection_state_inner(&self) {
++    async fn cleanup_connection_state_inner(&self, keep_voip_calls: bool) {
+         #[cfg(feature = "client-lifecycle")]
+         let login_transition = self
+             .login_transition
+@@ -1146,15 +1213,20 @@ impl Client {
+         #[cfg(feature = "client-lifecycle")]
+         drop(login_transition);
+         self.is_ready.store(false, Ordering::Relaxed);
+-        // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after
++        // Publish the disconnected state BEFORE the voip teardown (it used to be cleared only after
+         // the socket teardown below): a concurrent accept()/call() setup that finishes its async work
+         // in this window must see `!is_connected()` and bail instead of registering/connecting a call
+         // after this sweep.
+         self.is_connected.store(false, Ordering::Release);
+-        // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
+-        // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
++        // Reap every in-flight VoIP call — on TERMINAL disconnects only. On a transient transport
++        // blip the media relay (`net_conn`, a per-call UDP socket to the relay endpoint) is
++        // independent of the signaling WS: the driver holds its own relay path and the run loop
++        // reconnects under the blip, so the registry entries and media tasks stay put
++        // (`keep_voip_calls`, classified in `cleanup_connection_state_on_transport_loss`).
++        // Peer stanzas landing inside the gap are lost (no offline queue for call signaling) —
++        // accepted for ≤ a few-second blips (Task 1 findings).
+         #[cfg(feature = "voip-runtime")]
+-        {
++        if !keep_voip_calls {
+             self.call_registry.abort_all();
+             // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
+             // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
+diff --git a/src/voip/facade.rs b/src/voip/facade.rs
+index 1efe94fc..a8f0e691 100644
+--- a/src/voip/facade.rs
++++ b/src/voip/facade.rs
+@@ -4480,7 +4480,9 @@ mod tests {
+                 call_id: "CALL-AUDIO-MISMATCH".into(),
+                 call_creator: caller(),
+                 caller_pn: None,
++                caller_country_code: None,
+                 device_class: None,
++                joinable: false,
+                 is_video: false,
+                 audio: vec![wacore::types::call::CallAudioCodec {
+                     enc: "opus".into(),
+@@ -4514,7 +4516,9 @@ mod tests {
+                 call_id: "CALL-ANSWER-SIGNALING".into(),
+                 call_creator: caller(),
+                 caller_pn: None,
++                caller_country_code: None,
+                 device_class: None,
++                joinable: false,
+                 is_video: video,
+                 audio: vec![wacore::types::call::CallAudioCodec {
+                     enc: "opus".into(),
+@@ -5301,6 +5305,172 @@ mod tests {
+         );
+     }
+ 
++    // A signaling-WS blip reaches the run loop's cleanup as an UNEXPECTED read-loop exit with the
++    // client still running and auto-reconnect enabled. The media relay (`net_conn`) is a per-call
++    // UDP socket to the relay endpoint, independent of the signaling WS, and the run loop
++    // reconnects under it (~1 s IK handshake) — so that path must NOT reap the live call: the
++    // registry entry and media task stay put, and the same engine keeps driving the call once
++    // signaling stanzas flow again. Terminal exits still reap (the disconnect() tail below).
++    #[tokio::test]
++    async fn media_transport_survives_signaling_reconnect() {
++        let client = make_client().await;
++        // The run-loop state at the cleanup call site during a genuine blip.
++        client.is_running.store(true, Ordering::SeqCst);
++        client.enable_auto_reconnect.store(true, Ordering::SeqCst);
++
++        let (_relay_tx, relay_rx) = async_channel::unbounded();
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let factory = MockFactory {
++            sent: sent.clone(),
++            relay_rx: Mutex::new(Some(relay_rx)),
++            connects: Arc::new(AtomicUsize::new(0)),
++        };
++        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
++        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
++
++        let handle = spawn_call(
++            &client,
++            mk_session(),
++            engine(),
++            &factory,
++            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
++            None,
++        )
++        .await
++        .expect("spawn_call");
++
++        // Media is up: the driver emitted its initial STUN allocate over the relay transport.
++        for _ in 0..50 {
++            if !sent.lock().unwrap().is_empty() {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        assert!(!sent.lock().unwrap().is_empty(), "media transport is up");
++
++        // Fire the disconnect path the read-loop error takes, classified as a transient blip.
++        client
++            .cleanup_connection_state_on_transport_loss(true)
++            .await;
++
++        assert_eq!(
++            client.call_registry().active_count(),
++            1,
++            "a transient signaling blip must not reap the live call"
++        );
++        let media_task_alive =
++            tokio::time::timeout(Duration::from_millis(200), handle.wait_ended())
++                .await
++                .is_err();
++        assert!(
++            media_task_alive,
++            "the media task must still be running across the blip (net_conn not closed)"
++        );
++
++        // Terminal disconnect (is_running -> false) must still reap the call.
++        client.disconnect().await;
++        assert_eq!(
++            client.call_registry().active_count(),
++            0,
++            "terminal disconnect reaps the call"
++        );
++        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
++            .await
++            .expect("terminal disconnect must resolve wait_ended");
++    }
++
++    // The auto-reconnect term is not optional: an UNEXPECTED exit with auto-reconnect disabled
++    // reaches the run-loop cleanup with is_running still true (the loop breaks only after
++    // cleanup), so without this term a terminal shutdown would leak the registry entry and the
++    // open relay socket behind a dead call.
++    #[tokio::test]
++    async fn unexpected_exit_without_auto_reconnect_still_reaps_calls() {
++        let client = make_client().await;
++        client.is_running.store(true, Ordering::SeqCst);
++        client.enable_auto_reconnect.store(false, Ordering::SeqCst);
++
++        let (_relay_tx, relay_rx) = async_channel::unbounded();
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let factory = MockFactory {
++            sent: sent.clone(),
++            relay_rx: Mutex::new(Some(relay_rx)),
++            connects: Arc::new(AtomicUsize::new(0)),
++        };
++        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
++        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
++
++        let handle = spawn_call(
++            &client,
++            mk_session(),
++            engine(),
++            &factory,
++            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
++            None,
++        )
++        .await
++        .expect("spawn_call");
++        assert_eq!(client.call_registry().active_count(), 1);
++
++        client
++            .cleanup_connection_state_on_transport_loss(true)
++            .await;
++
++        assert_eq!(
++            client.call_registry().active_count(),
++            0,
++            "unexpected exit with auto-reconnect off is terminal: the call must be reaped"
++        );
++        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
++            .await
++            .expect("terminal reap must resolve wait_ended");
++    }
++
++    // reconnect()/reconnect_immediately() funnel into the run-loop cleanup classified Expected
++    // (unexpected=false). They are conceptually transient too, but wa-bridge never calls them
++    // mid-call (Task 1 findings), so the conservative teardown contract is preserved and pinned:
++    // an expected-exit cleanup reaps regardless of the run-loop flags.
++    #[tokio::test]
++    async fn expected_disconnect_cleanup_still_reaps_calls() {
++        let client = make_client().await;
++        client.is_running.store(true, Ordering::SeqCst);
++        client.enable_auto_reconnect.store(true, Ordering::SeqCst);
++
++        let (_relay_tx, relay_rx) = async_channel::unbounded();
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let factory = MockFactory {
++            sent: sent.clone(),
++            relay_rx: Mutex::new(Some(relay_rx)),
++            connects: Arc::new(AtomicUsize::new(0)),
++        };
++        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
++        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
++
++        let handle = spawn_call(
++            &client,
++            mk_session(),
++            engine(),
++            &factory,
++            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
++            None,
++        )
++        .await
++        .expect("spawn_call");
++        assert_eq!(client.call_registry().active_count(), 1);
++
++        client
++            .cleanup_connection_state_on_transport_loss(false)
++            .await;
++
++        assert_eq!(
++            client.call_registry().active_count(),
++            0,
++            "expected-exit cleanup (reconnect()/reconnect_immediately() shape) reaps the call"
++        );
++        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
++            .await
++            .expect("terminal reap must resolve wait_ended");
++    }
++
+     // An attached call that ends via the media layer (relay disconnect, no <terminate> stanza) drops
+     // its sibling-dismiss tracking automatically: the rung devices live on the registry session, which
+     // the media task's completion path removes. No separate per-call map to leak.
+@@ -6570,10 +6740,15 @@ mod tests {
+         }
+     }
+ 
+-    // Finding 1: the call is registered BEFORE the relay connect().await. If cleanup_connection_state
+-    // (abort_all) runs during that connect gap, the entry is gone by the time connect returns, so
+-    // set_media_task aborts the just-spawned media task immediately. The call must not survive as a
+-    // stale entry, and wait_ended() must resolve (the aborted task's drop-guard fires `ended`).
++    // Finding 1: the call is registered BEFORE the relay connect().await. If the TERMINAL
++    // disconnect sweep (abort_all — reached only when the disconnect is terminal, e.g.
++    // Client::disconnect() or auto-reconnect off) runs during that connect gap, the entry is gone
++    // by the time connect returns, so set_media_task aborts the just-spawned media task. The call
++    // must not survive as a stale entry, and wait_ended() must resolve (the aborted task's
++    // drop-guard fires `ended`). On the transient-blip path the sweep is skipped
++    // (cleanup_connection_state_on_transport_loss) and the entry stays; a gap spanning the whole
++    // blip still self-cleans via attach's is_connected re-check (Finding T below) — the call
++    // cannot attach while signaling is down.
+     #[tokio::test]
+     async fn cleanup_during_connect_gap_aborts_the_spawned_task() {
+         let client = make_client().await;
+diff --git a/wacore/src/voip/registry.rs b/wacore/src/voip/registry.rs
+index e1df0292..7cc6be6f 100644
+--- a/wacore/src/voip/registry.rs
++++ b/wacore/src/voip/registry.rs
+@@ -2644,7 +2644,9 @@ impl CallRegistry {
+     }
+ 
+     /// Abort every call's media task and clear the registry. Returns the number cleared.
+-    /// Call this from your own disconnect/reconnect teardown; it is not wired into the client.
++    /// Wired into the client's terminal disconnect sweep (`cleanup_connection_state_inner`,
++    /// skipped on transient transport blips so a call survives a signaling reconnect); also
++    /// usable directly for a consumer's own teardown.
+     pub fn abort_all(&self) -> usize {
+         self.ringing.lock().expect("registry lock poisoned").clear();
+         self.pending_initial_group_controls
+-- 
+2.43.0
+
