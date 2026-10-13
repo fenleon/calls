@@ -22,7 +22,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "calls"
 
-include(":app")
+include(":tool")
 include(":server")
 
 includeBuild("../light-sdk") {

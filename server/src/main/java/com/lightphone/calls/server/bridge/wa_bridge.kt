@@ -792,6 +792,8 @@ internal open class UniffiVTableCallbackInterfaceWaListener(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -844,6 +846,8 @@ fun uniffi_wa_bridge_checksum_method_wabridge_send_video_au(
 fun uniffi_wa_bridge_checksum_method_wabridge_set_muted(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_set_video_orientation(
+): Short
+fun uniffi_wa_bridge_checksum_method_wabridge_signal_video_stopped(
 ): Short
 fun uniffi_wa_bridge_checksum_method_wabridge_start(
 ): Short
@@ -951,6 +955,8 @@ fun uniffi_wa_bridge_fn_method_wabridge_set_muted(`ptr`: Pointer,`muted`: Byte,
 ): Long
 fun uniffi_wa_bridge_fn_method_wabridge_set_video_orientation(`ptr`: Pointer,`orientation`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_wa_bridge_fn_method_wabridge_signal_video_stopped(`ptr`: Pointer,
+): Long
 fun uniffi_wa_bridge_fn_method_wabridge_start(`ptr`: Pointer,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_wa_bridge_fn_method_wabridge_start_video(`ptr`: Pointer,`fps`: Int,
@@ -1146,6 +1152,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_set_video_orientation() != 13562.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wa_bridge_checksum_method_wabridge_signal_video_stopped() != 39945.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wa_bridge_checksum_method_wabridge_start() != 14634.toShort()) {
@@ -1850,6 +1859,12 @@ public interface WaBridgeInterface {
     fun `setVideoOrientation`(`orientation`: kotlin.UByte)
     
     /**
+     * Signals our camera OFF without leaving video mode: `<video state=6>` with the plane and
+     * the peer's video kept alive. The later camera-on is `announce_video_enabled` + media.
+     */
+    suspend fun `signalVideoStopped`()
+    
+    /**
      * Opens the SqliteStore session (restoring a previous pairing if one
      * exists), builds and spawns the real whatsapp-rust bot. Returns once
      * the bot is running; connection and pairing proceed on its tasks and
@@ -2362,6 +2377,32 @@ open class WaBridge: Disposable, AutoCloseable, WaBridgeInterface
     }
     
     
+
+    
+    /**
+     * Signals our camera OFF without leaving video mode: `<video state=6>` with the plane and
+     * the peer's video kept alive. The later camera-on is `announce_video_enabled` + media.
+     */
+    @Throws(WaException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `signalVideoStopped`() {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_wa_bridge_fn_method_wabridge_signal_video_stopped(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_wa_bridge_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        WaException.ErrorHandler,
+    )
+    }
 
     
     /**

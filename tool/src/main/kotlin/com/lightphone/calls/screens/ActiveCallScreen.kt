@@ -79,6 +79,7 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
     /** The video plane's reduced state + peer orientation (engine-owned). */
     val videoState = WaCallEngine.videoState
     val peerOrientation = WaCallEngine.peerOrientation
+    val peerFrameSize = WaCallEngine.peerFrameSize
 
     // Increments on every video tap that finds CAMERA ungranted, so each tap
     // re-arms the permission request even after a denial (the mic pattern).
@@ -157,29 +158,17 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
      *  first needs the CAMERA grant: ungranted taps request it (mic
      *  grammar), the engine holds the no-grant-no-camera backstop. */
     fun toggleVideo() {
-        when (val state = videoState.value) {
-            is VideoUiState.On -> WaCallEngine.stopVideo()
-            is VideoUiState.Off -> viewModelScope.launch {
+        when (videoState.value) {
+            VideoUiState.On -> WaCallEngine.stopVideo()
+            VideoUiState.Off -> viewModelScope.launch {
                 if (cameraPermissionGranted()) {
                     WaCallEngine.startVideo()
                 } else {
                     cameraRequestTick.value += 1
                 }
             }
-            is VideoUiState.UpgradeRequested -> Unit
         }
     }
-
-    fun acceptVideo() {
-        viewModelScope.launch {
-            if (cameraPermissionGranted()) {
-                WaCallEngine.acceptVideo()
-            } else {
-                cameraRequestTick.value += 1
-            }
-        }
-    }
-    fun declineVideo() = WaCallEngine.declineVideo()
 
     /** The peer-video TextureView's lifecycle → the engine's decode half. */
     fun attachSurface(surface: Surface?) = WaCallEngine.attachPeerSurface(surface)
@@ -214,6 +203,9 @@ class ActiveCallScreen(
         val bluetoothConnected by LightBluetooth.connected.collectAsState()
         val videoState by viewModel.videoState.collectAsState()
         val orientation by viewModel.peerOrientation.collectAsState()
+        // The peer stream's decoded size (decoder output format via the
+        // engine): the cover scale needs the source aspect, never the view's.
+        val videoSize by viewModel.peerFrameSize.collectAsState()
         val cameraRequestTick by viewModel.cameraRequestTick.collectAsState()
         val cameraLauncher = rememberPermissionRequestLauncher(Manifest.permission.CAMERA)
 
@@ -221,7 +213,6 @@ class ActiveCallScreen(
             if (cameraRequestTick > 0) cameraLauncher?.launch()
         }
         val videoOn = videoState is VideoUiState.On
-        val upgradeRequested = videoState is VideoUiState.UpgradeRequested
         // Native "call ended" panel (PHONE-PANELS.md §5.3: the bundle's
         // {title:'call ended', lightenTitle:true} DisplayArea overlay):
         // flashes before the log returns, for hang-up and peer-ended alike.
@@ -272,16 +263,20 @@ class ActiveCallScreen(
                         .fillMaxSize()
                         .graphicsLayer {
                             // Rotate per the peer's reported camera
-                            // orientation (90° steps 0..3). The exact
-                            // convention gets verified against a real call
-                            // in V4. A 90°-rotated full-bleed layer no
-                            // longer covers the screen, so odd steps scale
-                            // back up to stay full-bleed.
+                            // orientation (90° steps 0..3), then scale
+                            // uniformly to cover: the decoded frame's aspect
+                            // (e.g. 4:3) must never stretch to the view —
+                            // max of the two ratios fills the view and
+                            // center-crops the rest (the pivot is the view
+                            // center). Odd steps swap the source dimensions.
                             rotationZ = orientation * 90f
-                            if (orientation % 2 == 1) {
+                            val src = videoSize
+                            if (src != null && src.first > 0 && src.second > 0) {
+                                val rw = if (orientation % 2 == 1) src.second else src.first
+                                val rh = if (orientation % 2 == 1) src.first else src.second
                                 val cover = maxOf(
-                                    size.width.toFloat() / size.height,
-                                    size.height.toFloat() / size.width,
+                                    size.width / rw.toFloat(),
+                                    size.height / rh.toFloat(),
                                 )
                                 scaleX = cover
                                 scaleY = cover
@@ -335,43 +330,19 @@ class ActiveCallScreen(
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        // The upgrade prompt takes the status line's slot
-                        // (the confirm-panel's centered-question grammar).
                         LightText(
-                            text = when {
-                                upgradeRequested -> "video?"
-                                connected -> "connected"
-                                else -> "connecting..."
-                            },
+                            text = if (connected) "connected" else "connecting...",
                             variant = LightTextVariant.Copy,
                         )
                         Spacer(modifier = Modifier.padding(top = 2.73f.gridUnitsAsDp()))
                         LightText(
                             text = peerDisplay(peer),
-                            variant = if (formatPeer(peer).length <= PEER_FIT_CHARS) {
+                            variant = if (peerDisplay(peer).length <= PEER_FIT_CHARS) {
                                 LightTextVariant.Subtitle
                             } else {
                                 LightTextVariant.Heading
                             },
                         )
-                        if (upgradeRequested) {
-                            Spacer(modifier = Modifier.padding(top = 1.25f.gridUnitsAsDp()))
-                            // Accept/decline in the confirm-panel grammar:
-                            // × left, △ right (the incoming panel's split).
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                ConfirmIcon(
-                                    drawable = R.drawable.ic_lp3_confirm_x,
-                                    contentDescription = "Decline video",
-                                    onClick = viewModel::declineVideo,
-                                )
-                                Spacer(modifier = Modifier.padding(start = 4f.gridUnitsAsDp()))
-                                ConfirmIcon(
-                                    drawable = R.drawable.ic_lp3_confirm_triangle,
-                                    contentDescription = "Accept video",
-                                    onClick = viewModel::acceptVideo,
-                                )
-                            }
-                        }
                         Spacer(modifier = Modifier.padding(top = 1.25f.gridUnitsAsDp()))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             ToggleIcon(
@@ -510,7 +481,7 @@ private fun ConfirmIcon(
 internal const val PEER_FIT_CHARS = 22
 
 internal fun peerDisplay(peer: String): String {
-    val label = formatPeer(peer)
+    val label = callPeerLabel(peer)
     return if (label.length > PEER_FIT_CHARS) {
         label.take(PEER_FIT_CHARS) + "…"
     } else {

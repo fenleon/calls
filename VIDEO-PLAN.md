@@ -229,6 +229,9 @@ encode start (`onSensorOrientation`); `frontSensorOrientationSteps()` reads
 the same characteristic without a camera open (not CAMERA-gated);
 `WaCallEngine.videoOrientationSignal()` computes the signaled value, pushed
 before `startVideo`/`acceptVideo`/`acceptCall` and on every camera report.
-**Convention calibration:** raw sensor value vs complement `(4 - x) % 4` is
-calibrated on-device in the live retest — the computation lives only in
-`videoOrientationSignal()`, so flipping it is a one-line change.
+**Convention calibration:** CALIBRATED 2026-09-25 from the live captures
+(official portrait = wire 1; LP3 portrait = 3, renders upright): the raw
+base is correct, the `(4 - x) % 4` complement alternative is dead. The
+official device sends UNMASKED values (wire 4 observed for its 270°) — the
+rust `&0x03` mask is required. Receiver convention `rotationZ =
+orientation * 90f` raw is likewise confirmed. See PLAN.md §8 item 5.

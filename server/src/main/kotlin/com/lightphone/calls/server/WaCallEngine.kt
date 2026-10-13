@@ -22,14 +22,13 @@ import java.util.concurrent.atomic.AtomicInteger
  *  `VideoState`: 0 Disabled, 1 Enabled, 2 Paused, 3 UpgradeRequest,
  *  4 UpgradeAccept, 5 UpgradeReject, 6 Stopped, 7 UpgradeRejectByTimeout,
  *  8 UpgradeCancel, 9 UpgradeCancelByTimeout, 10 UnknownPeer,
- *  11 UpgradeRequestV2, 20 Error). The upgrade prompt gates on the
- *  request states (3/11 — the library's `is_upgrade_request()`); Enabled
- *  and an accepted upgrade are On; everything else is Off. */
+ *  11 UpgradeRequestV2, 20 Error). The states track OUR CAMERA only: On =
+ *  our direction is streaming, Off = it is not. Peer requests are
+ *  auto-accepted (WhatsApp model — no prompt) and peer camera on/off
+ *  (1/6) never touch this state; see [videoMode]. */
 sealed interface VideoUiState {
     data object Off : VideoUiState
     data object On : VideoUiState
-    /** Live peer upgrade request — the token echoes back to `acceptVideo`. */
-    data class UpgradeRequested(val token: WaVideoUpgradeToken) : VideoUiState
 }
 
 object WaCallEngine : WaListener {
@@ -93,6 +92,10 @@ object WaCallEngine : WaListener {
      *  half — the UI rotates the surface with it. */
     val peerOrientation = MutableStateFlow(0)
 
+    /** The peer stream's decoded dimensions (decoder output format) — the
+     *  UI's aspect-preserving cover scale needs the source aspect. */
+    val peerFrameSize = MutableStateFlow<Pair<Int, Int>?>(null)
+
     /** The call's video direction encode tier (SPEC §3.3). Its fps feeds the
      *  bridge's RTP timestamp stride on `startVideo`/`acceptVideo`. */
     private val videoTier = VideoTier.DEFAULT
@@ -112,6 +115,23 @@ object WaCallEngine : WaListener {
      *  before the user opted in). */
     @Volatile
     private var videoConsent = false
+
+    /** Bumped by every user video action (toggle, accept, decline, stop).
+     *  Wire-driven teardown (a `VideoStateChanged` reducing Off) only owns the
+     *  plane if no user action has happened since the event arrived — the
+     *  off→on toggle races this handler across IO threads, and a stale stop
+     *  must never kill a fresh enable. */
+    @Volatile
+    private var videoEpoch = 0L
+
+    /** True once the call is IN video mode (an upgrade was accepted in either
+     *  direction, or a video-from-start answer). WhatsApp model: the mode is
+     *  negotiated once, silently — each side's CAMERA is independent (our
+     *  camera state is [videoState]/[videoConsent], toggled by the user; the
+     *  peer's camera on/off arrives as state 1/6 and only affects what we
+     *  render). */
+    @Volatile
+    private var videoMode = false
 
     /** Auto-restarts since the last successful pairing — caps the watchdog /
      *  unlink respawn loop when recovery is hopeless. */
@@ -167,6 +187,12 @@ object WaCallEngine : WaListener {
      *  panel), later Ringing/CallStarted must not stack a second one. */
     @Volatile
     var activeScreenRouted: Boolean = false
+
+    /** True while an offer is ringing and unanswered — the state in which
+     *  leaving the incoming-call panel must decline (the ringer would
+     *  otherwise loop with no UI left to stop it). */
+    val ringing: Boolean
+        get() = currentCallPeer != null && !currentCallStarted
 
     /** Drops a dead call attempt (timeout / unreachable peer): the parked
      *  `placeCall` bridge call never returns, so its state is cleared here
@@ -318,6 +344,14 @@ object WaCallEngine : WaListener {
         // fake end paths below stop it).
         if (fakeCall) {
             Ringer.stop()
+            // Mirror the reducer's CallStarted branch (this direct publish
+            // skips it): `ringing` must flip false NOW — the incoming panel
+            // is about to be replaced, and its dispose guard declines a call
+            // that still looks unanswered (stopping the FGS mid-start crashes
+            // with ForegroundServiceDidNotStartInTime).
+            currentCallStarted = true
+            currentCallConnectedAt = System.currentTimeMillis()
+            pendingIncomingPeer = null
             appContext?.let { WaCallService.tryStart(it) }
             // Direct publish — the reducer's CallStarted branch doesn't run,
             // so the offer must be cleared here.
@@ -392,6 +426,19 @@ object WaCallEngine : WaListener {
     fun debugIncomingCall(peer: String = "15550102030") {
         fakeCall = true
         onEvent(WaEvent.IncomingCall(peer = peer, isVideo = false))
+        // A real caller eventually gives up (MissedCall); the fake offer
+        // never would — expire it like one, so a panel closed without
+        // answering can't ring forever. A real offer already ends via the
+        // bridge's missed event.
+        scope.launch {
+            kotlinx.coroutines.delay(30_000)
+            if (fakeCall && ringing) {
+                Ringer.stop()
+                dropCurrentCall()
+                fakeCall = false
+                publish(WaEvent.CallEnded(reason = "missed"))
+            }
+        }
     }
 
     /** Fire-and-forget decline of the incoming offer — runs on the engine's
@@ -565,8 +612,10 @@ object WaCallEngine : WaListener {
                     peerSurface = null
                     videoConsent = false
                     incomingVideoOffer = false
+                    videoMode = false
                     _videoState.value = VideoUiState.Off
                     peerOrientation.value = 0
+                    peerFrameSize.value = null
                     appContext?.let { WaCallService.tryStop(it) }
                     if (started && logPeer != null && logAt != 0L) {
                         callLog?.updateDuration(
@@ -672,22 +721,48 @@ object WaCallEngine : WaListener {
             }
             is WaEvent.VideoStateChanged -> {
                 Log.i(TAG, "video state: ${event.state}")
-                val next = reduceVideoState(event.state, event.upgrade)
-                _videoState.value = next
-                scope.launch {
-                    if (next is VideoUiState.Off) {
-                        // The video plane went down (peer stop, upgrade
-                        // reject/cancel/timeout, our stop): consent falls
-                        // with it — the glare-cancel contract says no video
-                        // signaling outlives the negotiation, and a later
-                        // enable is always an explicit user action.
-                        videoConsent = false
-                        stopVideoEncoding()
-                        stopVideoDecoding()
-                    } else {
-                        // Video On with the UI's surface already attached —
-                        // the decode half starts as soon as both hold.
+                when (event.state) {
+                    // Peer upgrade request: WhatsApp model — accept silently, no
+                    // prompt (the old prompt blocked the handshake until it timed
+                    // out: peer state 9). Video mode opens (the peer's video
+                    // renders); the local camera stays off until the user
+                    // toggles it.
+                    3, 11 -> if (event.upgrade != null) scope.launch {
+                        val ok = runCatching {
+                            bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
+                            bridgeOrThrow().acceptVideo(event.upgrade!!, videoTier.fps.toUInt())
+                            bridgeOrThrow().announceVideoEnabled()
+                        }.onFailure { Log.w(TAG, "video auto-accept failed: ${it.message}") }
+                            .isSuccess
+                        if (ok) {
+                            videoMode = true
+                            startVideoDecoding()
+                        } else {
+                            runCatching { bridge?.stopVideo() }
+                        }
+                    }
+                    // Peer accepted OUR upgrade: mode opens, decode starts.
+                    // 1 = peer camera on. Neither touches our camera state.
+                    4 -> if (!videoMode) {
+                        videoMode = true
                         startVideoDecoding()
+                    }
+                    1 -> if (videoMode) startVideoDecoding()
+                    // Peer camera off — the mode and our direction stay.
+                    6 -> Unit
+                    // Reject/cancel/timeout/disabled/error: the mode collapses.
+                    else -> {
+                        val eventEpoch = videoEpoch
+                        if (videoEpoch == eventEpoch) {
+                            _videoState.value = VideoUiState.Off
+                            scope.launch {
+                                if (videoEpoch != eventEpoch) return@launch
+                                videoConsent = false
+                                videoMode = false
+                                stopVideoEncoding()
+                                stopVideoDecoding()
+                            }
+                        }
                     }
                 }
             }
@@ -757,20 +832,16 @@ object WaCallEngine : WaListener {
     private fun videoOrientationSignal(): UByte = signaledOrientationSteps()
 
     /** The signaled-orientation composition — the ONLY place the orientation
-     *  math lives.
+     *  math lives. CALIBRATED against official WhatsApp (2026-09-25 captures:
+     *  official portrait = wire 1; LP3 portrait = 3, renders upright):
      *
-     *  (a) Portrait base: `front`, the front sensor's raw 90° steps.
-     *      CALIBRATION open: if the live retest shows the peer's video 180°
-     *      off (upside-down), the inverse convention applies to the base —
-     *      `(4 - front) % 4`.
-     *  (b) Composition assumption: the encoded frames rotate with the device
-     *      (surface input; the sensor is mounted relative to the natural
-     *      portrait orientation), so a UI rotation of `ui` steps shifts the
-     *      correction the receiver needs by the same `ui` steps —
-     *      `(front + ui) % 4`.
-     *  (c) BOTH the base (raw vs inverse) and the composition sign
-     *      (`+ ui` vs `- ui`) are verified in the next live retest — expect
-     *      exactly one flip; nothing outside this function moves. */
+     *  (a) Portrait base is the front sensor's RAW steps — the inverse
+     *      `(4 - front)` alternative is dead.
+     *  (b) Composition sign is `+ ui` (matches the official device's own
+     *      convention and physics). Unverifiable on the LP3 itself: LightOS
+     *      is portrait-locked, so the ui term is permanently 0 on-device.
+     *  (c) The official device sends its value UNMASKED (wire 4 observed);
+     *      the rust-side `& 0x03` mask is required and correct. */
     private fun signaledOrientationSteps(uiRotationSteps: Int = 0): UByte {
         val front = VideoLink.frontSensorOrientationSteps() ?: reportedSensorSteps ?: 0
         return (front + uiRotationSteps).mod(4).toUByte()
@@ -814,49 +885,35 @@ object WaCallEngine : WaListener {
      *  bridge's fps-paced media plane plus the local encoder. */
     fun startVideo() {
         scope.launch {
+            val epoch = ++videoEpoch
             try {
                 bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
-                bridgeOrThrow().startVideo(videoTier.fps.toUInt())
+                if (videoMode) {
+                    // Camera-on inside an open video mode: no new upgrade —
+                    // announce the direction and stream. (A second
+                    // `start_video` is refused by the registry: the plane is
+                    // already attached.)
+                    bridgeOrThrow().announceVideoEnabled()
+                } else {
+                    bridgeOrThrow().startVideo(videoTier.fps.toUInt())
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "startVideo failed: ${e.message}")
-                _videoState.value = VideoUiState.Off
-                _error.value = "video failed"
+                if (videoEpoch == epoch) {
+                    _videoState.value = VideoUiState.Off
+                    _error.value = "video failed"
+                }
                 return@launch
             }
             startVideoEncoding()
-            videoConsent = true
-            _videoState.value = VideoUiState.On
-        }
-    }
-
-    /** Accepts the peer's upgrade request (the prompt's accept tap): the
-     *  echoed token, then the standalone `<video state=1>` the protocol
-     *  wants after a mid-call upgrade completes. */
-    fun acceptVideo() {
-        val token = (_videoState.value as? VideoUiState.UpgradeRequested)?.token ?: return
-        scope.launch {
-            val ok = runCatching {
-                bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
-                bridgeOrThrow().acceptVideo(token, videoTier.fps.toUInt())
-                bridgeOrThrow().announceVideoEnabled()
-            }.onFailure { Log.w(TAG, "acceptVideo failed: ${it.message}") }.isSuccess
-            if (ok) {
-                startVideoEncoding()
+            // No link → the encode start surfaced its own failure (permission,
+            // camera): advertising On here would show a direction we cannot
+            // send.
+            if (encodeLink != null && videoEpoch == epoch) {
                 videoConsent = true
                 _videoState.value = VideoUiState.On
-            } else {
-                _videoState.value = VideoUiState.Off
-                _error.value = "video failed"
             }
         }
-    }
-
-    /** Declines the peer's upgrade request (the prompt's decline tap):
-     *  signals video-off — the bridge has no separate reject, and
-     *  `stopVideo` (state 6) is the wire's "not doing video" answer. */
-    fun declineVideo() {
-        _videoState.value = VideoUiState.Off
-        scope.launch { runCatching { bridge?.stopVideo() } }
     }
 
     /** Stops our video direction (toggle off): encoder and decoder down
@@ -865,11 +922,26 @@ object WaCallEngine : WaListener {
      *  signaling. Idempotent per the library. */
     fun stopVideo() {
         videoConsent = false
+        val epoch = ++videoEpoch
         _videoState.value = VideoUiState.Off
+        // Null the field synchronously: the async stop half must never race a
+        // quick re-enable into skipping the new start (encodeLink early
+        // return) or stopping the new link. Only the captured instance stops.
+        val link = encodeLink
+        encodeLink = null
+        val mode = videoMode
         scope.launch {
-            runCatching { bridge?.stopVideo() }
-            stopVideoEncoding()
-            stopVideoDecoding()
+            link?.stop()
+            // Camera off ≠ leaving video mode (WhatsApp model): signal
+            // Stopped and keep the plane — the peer's video keeps rendering
+            // and a later camera-on is announce + media. Full teardown only
+            // when the mode itself never existed (a plain audio call where
+            // the toggle opened it and the user closed it before anyone
+            // accepted).
+            runCatching {
+                if (mode) bridge?.signalVideoStopped() else bridge?.stopVideo()
+            }
+            if (!mode) stopVideoDecoding()
         }
     }
 
@@ -884,8 +956,15 @@ object WaCallEngine : WaListener {
             return
         }
         peerSurface = surface
-        if (_videoState.value is VideoUiState.On) startVideoDecoding()
+        if (_videoState.value is VideoUiState.On || videoMode) startVideoDecoding()
     }
+
+    /** Runtime opt-in (Settings diagnostics row, battery rule: off by
+     *  default): dumps the outbound AU stream (post-CSD-prepend) to
+     *  `filesDir/video-au-dump.h264` for ffprobe — the decode-failure
+     *  diagnostic for peer PLI storms. */
+    @Volatile
+    var videoAuDump = false
 
     private fun startVideoEncoding() {
         if (encodeLink != null || fakeCall) return
@@ -901,9 +980,13 @@ object WaCallEngine : WaListener {
         // Camera use is about to start: the call FGS claims its camera type
         // now, while the grant is in hand (Android 14 while-in-use rule).
         appContext?.let { WaCallService.elevateToCamera(it) }
+        var created: VideoLink? = null
         val link = VideoLink(
             sink = { au -> runCatching { bridge.sendVideoAu(au) }.getOrDefault(false) },
-            onLost = { reason -> onVideoEncodeLost(reason) },
+            dumpFile = if (videoAuDump) {
+                java.io.File(appContextForVideoLink().filesDir, "video-au-dump.h264")
+            } else null,
+            onLost = { reason -> onVideoEncodeLost(reason, created) },
             onSensorOrientation = { steps ->
                 reportedSensorSteps = steps
                 // The live handle is already attached here — keep it in sync
@@ -912,6 +995,7 @@ object WaCallEngine : WaListener {
             },
             onUiRotation = { steps -> onUiRotationReported(steps) },
         )
+        created = link
         link.start()
         encodeLink = link
     }
@@ -920,7 +1004,10 @@ object WaCallEngine : WaListener {
      *  honestly — video state off (the UI's toggle un-underlines), an error
      *  line, and the peer told we stopped. The decoder stops too (idempotent;
      *  don't rely on the relayed local state change). */
-    private fun onVideoEncodeLost(reason: String) {
+    private fun onVideoEncodeLost(reason: String, link: VideoLink?) {
+        // A newer link owns the plane — a stale callback from the old one
+        // must not tear it down.
+        if (link != null && encodeLink !== link) return
         Log.w(TAG, "video encode lost: $reason")
         encodeLink = null
         _videoState.value = VideoUiState.Off
@@ -948,6 +1035,7 @@ object WaCallEngine : WaListener {
                 output = surface,
                 pull = { bridge.recvVideoFrame(50u) },
                 onOrientation = { peerOrientation.value = it },
+                onFrameSize = { w, h -> peerFrameSize.value = w to h },
                 onEnded = { reason ->
                     Log.w(TAG, "video decode ended: $reason")
                     decodeLink = null
@@ -956,15 +1044,6 @@ object WaCallEngine : WaListener {
             link.start()
             decodeLink = link
         }
-    }
-
-    /** Maps a raw `VideoState` wire int onto [VideoUiState] (see the enum's
-     *  doc for the table). An upgrade request without a token can't be
-     *  answered — it degrades to Off instead of an unanswerable prompt. */
-    private fun reduceVideoState(state: Int, upgrade: WaVideoUpgradeToken?): VideoUiState = when (state) {
-        1, 4 -> VideoUiState.On // Enabled, UpgradeAccept
-        3, 11 -> upgrade?.let { VideoUiState.UpgradeRequested(it) } ?: VideoUiState.Off
-        else -> VideoUiState.Off
     }
 
     // Diagnostics exercises (no call, no traffic): the encoder exercise runs
@@ -1091,6 +1170,7 @@ object WaCallEngine : WaListener {
                         WaVideoFrame(au.data, au.keyframe, 0u)
                     }
                 },
+                onFrameSize = { w, h -> peerFrameSize.value = w to h },
                 onEnded = { reason ->
                     decodeExercise = null
                     exerciseNote.value = reason

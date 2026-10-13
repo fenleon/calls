@@ -11,6 +11,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -217,6 +220,23 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 videoExercise -> "Recording — tap to stop"
                                 else -> exerciseNote ?: "Diagnostics"
                             },
+                            variant = LightTextVariant.Detail,
+                        )
+                    }
+                    Spacer(modifier = Modifier.padding(top = 2f.gridUnitsAsDp()))
+                    var auDump by remember { mutableStateOf(WaCallEngine.videoAuDump) }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .lightClickable(onClick = {
+                                WaCallEngine.videoAuDump = !WaCallEngine.videoAuDump
+                                auDump = WaCallEngine.videoAuDump
+                            }),
+                    ) {
+                        LightText(text = "Video AU dump", variant = LightTextVariant.Heading)
+                        Spacer(modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()))
+                        LightText(
+                            text = if (auDump) "Recording — tap to stop" else "Diagnostics",
                             variant = LightTextVariant.Detail,
                         )
                     }

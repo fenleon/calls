@@ -3,14 +3,10 @@ package com.lightphone.calls.server
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
-import android.content.pm.PackageManager
-import android.content.pm.Signature
 import android.database.Cursor
 import android.net.Uri
-import com.thelightphone.sdk.server.ClientCertType
 import com.thelightphone.sdk.server.ClientFilterLevel
 import com.thelightphone.sdk.server.LightSdkServer
-import java.security.MessageDigest
 
 // SHA-256 fingerprint of sdk/keys/lightsdk-dev.jks (alias: lightsdk-dev). Any
 // APK signed with the workspace dev key is treated as Light-SDK-signed.
@@ -35,7 +31,15 @@ class ServerBootstrapProvider : ContentProvider() {
 
         with(LightSdkServer) {
             defaultClientFilterLevel = ClientFilterLevel.AllowLightSignedApks
-            checkCert = { callingPackage -> checkLightSdkCert(context, callingPackage) }
+            // Upstream LightSdkServer.checkCert now does the lookup itself; keep
+            // the workspace dev-keystore allowance (dev-key APKs on the emulator/
+            // dev device) by OR-ing the dev cert hash into the isLightSigned hook
+            // (imessage pattern).
+            val upstreamIsLightSigned = isLightSigned
+            isLightSigned = { callingPackage, signatureHash ->
+                upstreamIsLightSigned(callingPackage, signatureHash) ||
+                    signatureHash.equals(LIGHTSDK_DEV_CERT_SHA256, ignoreCase = true)
+            }
             // Platform relay (PLATFORM-RELAY.md): self-serving app, so forward
             // what we don't consume ourselves — Calls uses no hardware keys,
             // and haptics preferences come from the real device.
@@ -55,29 +59,6 @@ class ServerBootstrapProvider : ContentProvider() {
         }
         PlatformRelay.bind(context)
         return true
-    }
-
-    private fun checkLightSdkCert(context: Context, callingPackage: String): ClientCertType {
-        val info = try {
-            context.packageManager.getPackageInfo(
-                callingPackage,
-                PackageManager.GET_SIGNING_CERTIFICATES,
-            )
-        } catch (e: PackageManager.NameNotFoundException) {
-            return ClientCertType.Unknown
-        }
-        val signingInfo = info.signingInfo ?: return ClientCertType.Unknown
-        val signers: Array<Signature> = if (signingInfo.hasMultipleSigners()) {
-            signingInfo.apkContentsSigners
-        } else {
-            signingInfo.signingCertificateHistory
-        }
-        val md = MessageDigest.getInstance("SHA-256")
-        val matches = signers.any { sig ->
-            md.digest(sig.toByteArray()).toHexString()
-                .equals(LIGHTSDK_DEV_CERT_SHA256, ignoreCase = true)
-        }
-        return if (matches) ClientCertType.LightSdkSignedUnverified else ClientCertType.Unknown
     }
 
     private fun ByteArray.toHexString(): String = joinToString("") { "%02X".format(it) }

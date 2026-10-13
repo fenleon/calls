@@ -154,14 +154,6 @@ class HomeViewModel : LightViewModel<Unit>() {
         }
     }
 
-    /** Known contact names, keyed both by full JID and bare number so a log
-     *  entry stored under either form resolves. */
-    private fun contactNames(): Map<String, String> =
-        WaCallEngine.contactEntries()
-            .filter { it.name.isNotEmpty() }
-            .flatMap { listOf(it.id to it.name, peerLabel(it.id) to it.name) }
-            .toMap()
-
     /** One active-call push per call: the dial tap already routed the panel
      *  for outgoing (engine flag), and the ringing panel itself observes
      *  `CallStarted` — a later event must not stack a second screen. */
@@ -352,6 +344,19 @@ internal fun formatDuration(seconds: Long): String {
 
 /** A stored peer JID ("49…@s.whatsapp.net" or bare number) as a number. */
 internal fun peerLabel(peer: String): String = peer.substringBefore('@')
+
+/** Known contact names, keyed both by full JID and bare number so a peer
+ *  stored under either form resolves. */
+internal fun contactNames(): Map<String, String> =
+    WaCallEngine.contactEntries()
+        .filter { it.name.isNotEmpty() }
+        .flatMap { listOf(it.id to it.name, peerLabel(it.id) to it.name) }
+        .toMap()
+
+/** The peer label for a live call: contact name when known, the native
+ *  "+cc number" layout otherwise. */
+internal fun callPeerLabel(peer: String, names: Map<String, String> = contactNames()): String =
+    names[peer] ?: names[peerLabel(peer)] ?: formatPeer(peer)
 
 /** Render a peer the way the native Phone does — an international
  *  "+cc number" layout (PhoneNumberUtils; E.164 input needs no region) —

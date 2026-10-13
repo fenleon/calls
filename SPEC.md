@@ -26,7 +26,7 @@ calls/
 ```
 
 - `:server` hosts the `LightSdkService`; `serverPackage` = own id (`com.thelightphone.sdk.emulator` on the emulator). All non-allowlisted code (JNI, tokio, SQLite session store) lives here; `:app` stays plugin-clean.
-- Rust targets: `aarch64-linux-android` (LP3) + `x86_64-linux-android` (emulator). Build via cargo-ndk wired into Gradle; `tools/build --dir calls :app:assembleDebug` is the only installable output.
+- Rust targets: `aarch64-linux-android` (LP3) + `x86_64-linux-android` (emulator). Build via cargo-ndk wired into Gradle; `tools/build --dir calls :tool:assembleDebug` is the only installable output.
 - No sans-IO `CallEngine` work — the `client.voip()` facade runs on an in-process tokio runtime inside the bridge.
 
 ### Data flow (audio call)

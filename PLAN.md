@@ -162,49 +162,89 @@ sensor 270; raw base confirmed — the official device renders the LP3's stream 
 receiver rotation now visually applies (TextureView, def3119); cold-start incoming
 routing works when the bot is up. Open items below, ordered roughly by severity.
 
-1. **Fresh install: no incoming call at all.** Before first app open post-install, an
-   incoming call is missed; opening the app did not surface it either. Hypotheses:
-   WaSyncService not started on fresh install (no POST_INSTALL trigger — §2 family);
-   and/or the offer died before the first WS connect finished (bot up but not yet
-   connected when the caller gave up). Needs: install-event receiver or FGS-start on
-   update, plus log the WS-connect-ready timestamp vs offer arrival.
+1. **Fresh install: no incoming call at all.** *(code landed 2026-09-25; live
+   verify pending)* Root: the sync FGS only ever started from the
+   ContentProvider — nothing restarted it after `adb install -r` or a reboot
+   (START_STICKY doesn't survive either). Fix: `WaBootReceiver`
+   (`BOOT_COMPLETED` + `MY_PACKAGE_REPLACED` → `WaSyncService.tryStart`); a
+   first-ever install still needs one app launch (Android sends the app
+   nothing on first install). WS-connect-ready vs offer-arrival timestamps
+   still to be logged on the next live repro.
 2. *(renumbered from §3 below — see video-from-start)*
-3. **Video-from-start calls broken toward official.** Official initiates a video call
-   → LP3 doesn't receive it as a video call; and toggling video on the LP3 in that
-   call returns "video failed". Suspect `VideoNotOffered` handling + the incoming
-   `is_video` accept path (bridge `accept_call(with_video)` + builder `.video(...)`)
-   never exercised against a real official offer — unit-shaped, never live-tested.
-   Note 9e5a342's residual: wacore `video_offer_node`/`video_accept_node` still
-   hardcode device_orientation 0 (video-from-start signaling) — relevant here.
-4. **Camera off→on toggle never re-establishes.** stop→start on the encode link:
-   camera/encoder released on stop but the reopen path doesn't produce frames (LP3
-   picture freezes, peer gets no video). V1's stop-race guards (`running` set
-   synchronously) may be blocking the second start; or Camera2 reopen fails silently.
-   Needs a toggle-cycle test on the emulator + fix.
-5. **Rotation: three of four directions reorientate; clockwise doesn't.** Rotating the
-   official device clockwise produced no reorientation on the LP3 (the 0→1 signal
-   change DID arrive in the 11:09 capture, so the signal works — suspect the receiver
-   composition `(front + ui)` mapping: one quadrant maps to the same value, or the
-   re-announce debounce eats it). Also unconfirmed whether rotating the LP3 itself
-   updates the official device. Calibrate the full 4×4 matrix (both devices' signals
-   are in the captures) and fix the composition.
-6. **Aspect ratio: squash/stretch instead of crop.** The graphicsLayer full-bleed
-   scale stretches odd-step rotations; even steps stretch 4:3 → 1080×1240. Fix:
-   aspect-preserving scale = max(target.w/src.w, target.h/src.h) with center crop
-   (compute from the decoded size + rotation), on both the video surface and the
-   diagnostics screen.
-7. **Low FPS when the mic is on.** LP3's outgoing feed drops frames with mic active,
-   perfect with mic off. Suspects: VOICE_COMMUNICATION HAL AEC load vs encoder on the
-   G99, thread priority contention (AudioRecord URGENT_AUDIO vs camera/encoder
-   handler), or shared HAL/camera conflict. Measure with the media_stats counters +
-   `OutboundMediaDropped` while toggling mic.
-8. **Our-initiated video never sends.** When the OTHER device initiates the upgrade,
-   our video flows; when the LP3 enables video (outgoing upgrade via `startVideo`) or
-   accepts a video-from-start call, our encoder never starts (peer gets no video).
-   Points at the `videoConsent` gating: `acceptVideo`/`startVideo` set it and start
-   the encode — but the real-flow entry points (post-state-11 accept, video-from-start
-   answer) evidently don't reach the encode start. Trace `videoConsent` through the
-   live flow with logs; the V2 consent fix overcorrected for these paths.
+3. **Video-from-start toward official.** *(root cause found 2026-09-25; fix
+   landed; live verify pending)* The offer parser is CORRECT —
+   the captured official iPhone offer carries `<video enc=…/>` and parses
+   `is_video=true`. Answering a video offer seeds `self_state=Enabled`
+   whether or not a local plane attached, which the old registry refused on
+   later toggles ("video transition already in progress", lp3-retest.log
+   11:33:10) — fixed in the registry (item 8). The audio-only answer
+   fallback (`WaCallEngine.kt:338` / bridge `accept_call` gate) is by design.
+4. **Camera off→on toggle never re-establishes.** *(superseded 2026-09-25
+   evening by the WhatsApp video model, §8.9 below)* The original toggle
+   race (stop/start halves on `Dispatchers.IO`, stale echo teardown) was
+   fixed (captured-link stop + `videoEpoch` guard), but the whole toggle
+   semantics changed with the model: the toggle is now the CAMERA on/off
+   inside an open video mode, not a mode switch.
+5. **Rotation: three of four directions reorientate; clockwise doesn't.**
+   *(RESOLVED 2026-09-25, calibration from the captures — no code change)*
+   The 0→1 in the 11:09 capture is not a rotation: official's video module
+   was off (state-0, default orient 0) and came back ON at portrait
+   (official's home signal = 1) — nothing was ever on screen to reorient,
+   and no wire 2 ever appeared in that call. Calibration (official sender):
+   portrait=1, ±90°=2/3, 270°=4 (UNMASKED — the rust `&0x03` mask is
+   required and correct). The committed convention is right: sender
+   `(front + ui) mod 4` raw, receiver `rotationZ = orientation * 90f` raw,
+   no complement anywhere. LP3-side mid-call rotation is dead code on-device
+   (LightOS is portrait-locked — the DisplayListener never fires).
+6. **Aspect ratio: squash/stretch instead of crop.** *(fix landed
+   2026-09-25; verified on the emulator decode-test screen)* Frame size from
+   the decoder's output format (`VideoDecodeLink.onFrameSize` →
+   `peerFrameSize`; `getDefaultBufferSize` is not public API) and both the
+   call screen and the decode-test screen apply an aspect-preserving cover
+   scale (`max(w/sw, h/sh)`, center pivot, rotation swap on odd steps). No
+   stretch at any rotation.
+7. **Low FPS when the mic is on.** Open — needs live measurement (media_stats
+   counters + `OutboundMediaDropped` while toggling mic on the LP3).
+8. **Our-initiated video never sends.** *(REFRAME 2026-09-25: the initiator
+   flow has NEVER worked — the morning "working" video was the acceptor
+   role only.)* The subagent diff of lp3-retest.log vs lp3-verify.log:
+   every morning LP3-initiated call had its encoder killed ~500 ms in by the
+   old state-6 handling (encode stop "0/1 AUs"), before the acceptor's gate
+   ever opened; the two-way morning video was peer-initiated (LP3 =
+   acceptor, `VideoControl::Enable` from the start). After the registry +
+   toggle fixes, the initiator streams valid H.264 (AU dump ffprobe-clean,
+   NAL layout identical to the V1-validated capture) after the peer's
+   auto-accept (state 4) — and the official responder STILL doesn't decode
+   it: PLI storm (~450 ms), never renders, never sends its state-1, reverts
+   (~8 s) with `<terminate>`. Experiments: (a) registry plane-gate fix
+   (removed the false "transition already in progress"), (b) ungate the
+   initiator immediately (EnableAwaitingAccept → Enable, facade.rs:3591) —
+   NO difference, so the gate window is not the culprit; the gap is
+   handshake-side (hypothesis: the official responder needs the initiator's
+   full request shape — the official's own state-11 carries
+   `dec="H264,H265,AV1"` + `screen_width/height`, ours carries
+   `dec="H264"` only; `voip_settings="video"` is already sent).
+9. **WhatsApp video model (2026-09-25 evening, user insight — implemented,
+   build green, NOT yet on-device).** Our "upgrade?" prompt was nonstandard
+   and blocked handshakes (the rig test died in state 9 =
+   UpgradeCancelByTimeout while the prompt sat unanswered). WhatsApp: no
+   prompt — the upgrade auto-accepts, video MODE opens (peer's video
+   renders), each side's CAMERA is independent. Implemented: rust facade
+   `signal_video_stopped()` (state-6 camera-off that KEEPS the plane, vs
+   `stop_video` full teardown) + bridge wrapper; Kotlin `videoMode` flag —
+   peer state 3/11+token auto-accepts silently (acceptVideo machinery,
+   no encode), 4 opens the mode, 1/6 (peer camera) only affect decode,
+   reject/cancel/timeout collapse the mode; toggle = camera on (announce +
+   media, no re-upgrade when the mode is open) / off (signal_video_stopped,
+   decode keeps running); `UpgradeRequested` state, the prompt row and
+   `acceptVideo`/`declineVideo` removed.
 
-Next session: start at 8→3 (both are consent/accept-path bugs, likely one root),
-then 4, then 5+6 (receiver rendering), then 7 (perf), then 1 (fresh-install FGS).
+Next session: install the WhatsApp-model build on the LP3 + emulator
+(APK built, NOT installed), then: (1) rig test — emulator places audio
+call, LP3 answers + taps video (initiator); the emulator now auto-accepts —
+if IT decodes the LP3's initiator stream, our sender is fine and the
+official responder needs the stanza-shape enrichment (mirror the official's
+`dec` + screen dims on state-11); if not, our initiator sender path is
+buggy and debuggable locally. (2) Then the official phone matrix: LP3
+initiator, video-from-start both directions, camera toggles both sides.
+(3) Then item 7 (mic-on FPS) and item 6 rotation checks.

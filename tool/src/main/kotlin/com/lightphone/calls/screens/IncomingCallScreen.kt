@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -134,6 +135,13 @@ class IncomingCallScreen(
         LaunchedEffect(cameraRequestTick) {
             if (cameraRequestTick > 0) cameraLauncher?.launch()
         }
+        // Leaving the ringing panel without answering (back out) declines —
+        // otherwise the ringer keeps looping with no UI left to stop it.
+        // Also fires on accept (the panel is replaced): by then the call has
+        // started, so [WaCallEngine.ringing] is false and this is a no-op.
+        DisposableEffect(Unit) {
+            onDispose { if (WaCallEngine.ringing) WaCallEngine.reject() }
+        }
 
         // Native Phone incoming grammar (calls/PHONE-PANELS.md §1/§5):
         // "incoming..." status line (copy, lighten) above the peer
@@ -164,9 +172,10 @@ class IncomingCallScreen(
                             variant = LightTextVariant.Copy,
                         )
                         Spacer(modifier = Modifier.padding(top = 1.5f.gridUnitsAsDp()))
+                        val label = callPeerLabel(peer)
                         LightText(
-                            text = formatPeer(peer),
-                            variant = if (formatPeer(peer).length <= PEER_FIT_CHARS) {
+                            text = label,
+                            variant = if (label.length <= PEER_FIT_CHARS) {
                                 LightTextVariant.Subtitle
                             } else {
                                 LightTextVariant.Heading

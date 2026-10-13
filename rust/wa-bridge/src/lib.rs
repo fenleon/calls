@@ -1513,6 +1513,25 @@ impl WaBridge {
         .await
     }
 
+    /// Signals our camera OFF without leaving video mode: `<video state=6>` with the plane and
+    /// the peer's video kept alive. The later camera-on is `announce_video_enabled` + media.
+    pub async fn signal_video_stopped(&self) -> Result<(), WaError> {
+        let handle = self
+            .call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(WaError::NoActiveCall)?;
+        let ctx = self.call_ctx();
+        join(ctx.runtime.clone().spawn(async move {
+            handle
+                .signal_video_stopped()
+                .await
+                .map_err(|e| WaError::Protocol { msg: e.to_string() })
+        }))
+        .await
+    }
+
     /// Stops OUR video direction (sends `<video state=6>`, tears the local
     /// media plane down). Idempotent per the library, so a duplicate stop is
     /// a no-op, never an error for the call UI.

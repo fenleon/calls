@@ -16,6 +16,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.viewinterop.AndroidView
 import com.lightphone.calls.server.WaCallEngine
 import com.thelightphone.sdk.LightScreen
@@ -68,6 +69,9 @@ class VideoDecodeTestScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val note by viewModel.note.collectAsState()
+        // The decode exercise reports the stream's decoded size through the
+        // engine (same flow the call screen uses).
+        val videoSize by WaCallEngine.peerFrameSize.collectAsState()
 
         // Leaving the screen releases the decode exercise and its texture.
         DisposableEffect(Unit) {
@@ -82,9 +86,22 @@ class VideoDecodeTestScreen(
             ) {
                 // TextureView, matching the call screen: its listener fires
                 // reliably on re-entry (the old SurfaceView's did not), so
-                // no poll fallback is needed.
+                // no poll fallback is needed. Cover-scaled like the call
+                // screen — uniform scale, center crop, no stretch.
                 AndroidView(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            val src = videoSize
+                            if (src != null && src.first > 0 && src.second > 0) {
+                                val cover = maxOf(
+                                    size.width / src.first.toFloat(),
+                                    size.height / src.second.toFloat(),
+                                )
+                                scaleX = cover
+                                scaleY = cover
+                            }
+                        },
                     factory = { context ->
                         TextureView(context).apply {
                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {

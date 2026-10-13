@@ -10,6 +10,15 @@ plugins {
 android {
     compileSdk = 36
 
+    packaging {
+        // Netty (via the SDK's ktor stack) repeats these per-jar index files;
+        // the merger refuses duplicates without an exclude (chats pattern).
+        resources.excludes += setOf(
+            "META-INF/INDEX.LIST",
+            "META-INF/io.netty.versions.properties",
+        )
+    }
+
     signingConfigs {
         create("lightsdkDev") {
             storeFile = file("../../light-sdk/sdk/keys/lightsdk-dev.jks")

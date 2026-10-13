@@ -496,6 +496,7 @@ class VideoDecodeLink(
     private val output: Surface,
     private val pull: () -> WaVideoFrame?,
     private val onOrientation: (Int) -> Unit = {},
+    private val onFrameSize: (Int, Int) -> Unit = { _, _ -> },
     private val onEnded: (String) -> Unit = {},
     /** 2 s fed/rendered heartbeat — diagnostics only (battery rule: verbose
      *  logging is a runtime opt-in; the decode path never logs in production). */
@@ -610,7 +611,17 @@ class VideoDecodeLink(
                     decoder.releaseOutputBuffer(index, true)
                     rendered++
                 }
-                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
+                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    // The real dimensions arrive here (the configure format's
+                    // are placeholders) — report once per renegotiation.
+                    val fmt = decoder.outputFormat
+                    runCatching {
+                        onFrameSize(
+                            fmt.getInteger(MediaFormat.KEY_WIDTH),
+                            fmt.getInteger(MediaFormat.KEY_HEIGHT),
+                        )
+                    }
+                }
                 else -> return rendered // TRY_AGAIN — nothing more to render right now
             }
         }

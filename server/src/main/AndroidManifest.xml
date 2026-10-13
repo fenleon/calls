@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application>
         <provider
@@ -23,6 +24,17 @@
             android:name=".WaSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Restart that socket after boot / package update (both are
+             protected system broadcasts — only the system can send them). -->
+        <receiver
+            android:name=".WaBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Fronts an active call (mic + camera capture while
              foreground-visible). Both while-in-use types are declared; the

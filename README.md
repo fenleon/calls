@@ -64,7 +64,7 @@ Prerequisites:
 Then, from the workspace root (or anywhere with `gradlew` + env active):
 
 ```bash
-tools/build --dir calls :app:assembleDebug
+tools/build --dir calls :tool:assembleDebug
 ```
 
 The `:server` `buildRust` task cross-compiles the `wa-bridge` crate
