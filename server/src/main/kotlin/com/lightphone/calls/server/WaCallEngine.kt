@@ -872,7 +872,11 @@ object WaCallEngine : WaListener {
      *  rotation re-signals the composed orientation and re-announces it (a
      *  fresh `<video state=1>` — the receiving engine re-stamps the peer
      *  orientation per node). Debounced ~300 ms; failures are logged and
-     *  dropped — no retry loops (battery rule). */
+     *  dropped — no retry loops (battery rule). The On-check runs at FIRE
+     *  time under [videoSignalLock] (the capture-time one only gates arming):
+     *  a rotate→toggle-off inside the debounce window must not re-announce
+     *  the direction after the stop's `<video state=6>` — that is the same
+     *  Stopped-after-Enabled inversion as the off→on race, reversed. */
     private fun onUiRotationReported(uiRotationSteps: Int) {
         if (_videoState.value !is VideoUiState.On) return
         val signal = signaledOrientationSteps(uiRotationSteps)
@@ -880,12 +884,15 @@ object WaCallEngine : WaListener {
         rotationResignalJob?.cancel()
         rotationResignalJob = scope.launch {
             kotlinx.coroutines.delay(ROTATION_RESIGNAL_DEBOUNCE_MS)
-            lastSignaledOrientation = signal
             val bridge = bridge ?: return@launch
-            runCatching {
-                bridge.setVideoOrientation(signal)
-                bridge.announceVideoEnabled()
-            }.onFailure { Log.w(TAG, "rotation re-signal failed: ${it.message}") }
+            videoSignalLock.withLock {
+                if (_videoState.value !is VideoUiState.On) return@launch
+                lastSignaledOrientation = signal
+                runCatching {
+                    bridge.setVideoOrientation(signal)
+                    bridge.announceVideoEnabled()
+                }.onFailure { Log.w(TAG, "rotation re-signal failed: ${it.message}") }
+            }
         }
     }
 
@@ -899,6 +906,7 @@ object WaCallEngine : WaListener {
         // Captured synchronously: tap order must be epoch order, or a fast
         // off→on could hand the fresher epoch to the stale stop.
         val epoch = ++videoEpoch
+        val mode = videoMode
         scope.launch {
             try {
                 videoSignalLock.withLock {
@@ -915,6 +923,19 @@ object WaCallEngine : WaListener {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "startVideo failed: ${e.message}")
+                // A quick off→on SKIPS the stop (its Stopped would land after
+                // this Enabled), so a failed announce would leave the peer
+                // "Enabled" with a dead stream until the next toggle.
+                // Best-effort compensation while this is still the newest
+                // action — announce path only: a failed `start_video` rolls
+                // its plane back inside the library.
+                if (videoEpoch == epoch && mode) {
+                    runCatching {
+                        videoSignalLock.withLock {
+                            if (videoEpoch == epoch) bridge?.signalVideoStopped()
+                        }
+                    }
+                }
                 if (videoEpoch == epoch) {
                     _videoState.value = VideoUiState.Off
                     _error.value = "video failed"
@@ -940,6 +961,10 @@ object WaCallEngine : WaListener {
         videoConsent = false
         val epoch = ++videoEpoch
         _videoState.value = VideoUiState.Off
+        // A pending rotation re-announce must not fire after this stop —
+        // its `<video state=1>` would re-enable the direction we are turning
+        // off (same inversion as the off→on race).
+        rotationResignalJob?.cancel()
         // Null the field synchronously: the async stop half must never race a
         // quick re-enable into skipping the new start (encodeLink early
         // return) or stopping the new link. Only the captured instance stops.
