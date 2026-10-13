@@ -1,0 +1,275 @@
+From f39d3c63028439618594612cbfd0a24976254cee Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:34:56 +0200
+Subject: [PATCH 5/5] voip: peer orientation survives media-engine rebuild
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A peer camera off→on rebuilds the media engine, and the rebuilt one
+seeded peer orientation 0 — the incoming video flashed CW-90. The
+registry now owns a per-call peer-orientation cell: the live engine
+writes every <video device_orientation> through
+(CallEngine::set_peer_video_orientation) and every engine seeds from
+the cell at attach (attach_engine), so a same-generation rebuild
+inherits the peer's last-known rotation. The signaling handler also
+records the value next to the SetOrientation forward, covering the
+no-engine-attached window.
+---
+ src/handlers/call.rs        |  8 +++++
+ src/voip/facade.rs          |  9 +++++
+ wacore/src/voip/engine.rs   | 66 +++++++++++++++++++++++++++++++++--
+ wacore/src/voip/registry.rs | 69 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 150 insertions(+), 2 deletions(-)
+
+diff --git a/src/handlers/call.rs b/src/handlers/call.rs
+index 84a2ebdf..1123b4e7 100644
+--- a/src/handlers/call.rs
++++ b/src/handlers/call.rs
+@@ -907,6 +907,14 @@ impl StanzaHandler for CallHandler {
+                         transition_current &= registry.is_current(call_id, generation);
+                         if transition_current {
+                             if let Some(orientation) = orientation {
++                                // Record before forwarding: the cell must hold the last-known
++                                // value even if no engine is attached to receive the control
++                                // (a media-plane rebuild seeds from the cell, not from 0).
++                                registry.set_peer_video_orientation(
++                                    call_id,
++                                    generation,
++                                    *orientation,
++                                );
+                                 registry.send_video_ctl(
+                                     call_id,
+                                     generation,
+diff --git a/src/voip/facade.rs b/src/voip/facade.rs
+index 239cb758..c78e139a 100644
+--- a/src/voip/facade.rs
++++ b/src/voip/facade.rs
+@@ -2630,6 +2630,15 @@ async fn attach_engine(
+     // self LID and never rekeys).
+     rekey_rx: Option<async_channel::Receiver<String>>,
+ ) -> Result<(), CallError> {
++    // Seed the engine from the registry's peer-orientation cell and arm the write-through: a
++    // media-plane rebuild (peer stop→start on the same generation) must inherit the peer's
++    // last-known rotation, not flash the incoming video back to 0.
++    let mut engine = engine;
++    engine.attach_peer_orientation_cell(
++        client
++            .call_registry()
++            .peer_video_orientation_cell(call_id, generation),
++    );
+     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
+     if !client.call_registry().set_group_control_sender(
+         call_id,
+diff --git a/wacore/src/voip/engine.rs b/wacore/src/voip/engine.rs
+index c8aa5e4e..213fc4b0 100644
+--- a/wacore/src/voip/engine.rs
++++ b/wacore/src/voip/engine.rs
+@@ -14,8 +14,10 @@
+ 
+ use std::collections::{HashMap, VecDeque};
+ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
++use std::sync::Arc;
+ 
+ use bytes::Bytes;
++use portable_atomic::{AtomicU8, Ordering};
+ 
+ use super::app_data;
+ use super::audio::{
+@@ -787,6 +789,10 @@ pub struct CallEngine {
+     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
+     /// every reassembled inbound AU so the sink can rotate.
+     peer_video_orientation: u8,
++    /// The registry's peer-orientation cell (wired at attach, `None` for bare engines): every
++    /// [`Self::set_peer_video_orientation`] writes through so the value outlives this engine, and
++    /// a rebuilt engine seeds from the cell instead of flashing back to 0.
++    peer_orientation_cell: Option<Arc<AtomicU8>>,
+     outbox: VecDeque<Output>,
+ }
+ 
+@@ -927,6 +933,7 @@ impl CallEngine {
+             group: None,
+             media,
+             peer_video_orientation: 0,
++            peer_orientation_cell: None,
+             outbox: VecDeque::new(),
+         })
+     }
+@@ -1587,9 +1594,29 @@ impl CallEngine {
+     }
+ 
+     /// Record the peer's device orientation (0..3, ×90°) from a `<video>` stanza; stamped on every
+-    /// subsequently reassembled inbound AU.
++    /// subsequently reassembled inbound AU. Writes through to the registry's cell when one is
++    /// attached, so a rebuilt engine seeds the last-known value instead of 0.
+     pub fn set_peer_video_orientation(&mut self, orientation: u8) {
+-        self.peer_video_orientation = orientation & 0x03;
++        let orientation = orientation & 0x03;
++        self.peer_video_orientation = orientation;
++        if let Some(cell) = &self.peer_orientation_cell {
++            cell.store(orientation, Ordering::Relaxed);
++        }
++    }
++
++    /// The peer's device orientation (0..3, ×90°).
++    pub fn peer_video_orientation(&self) -> u8 {
++        self.peer_video_orientation
++    }
++
++    /// Wire the registry's peer-orientation cell. Seeds from it — a media-plane rebuild (peer
++    /// stop→start on the same call generation) must inherit the peer's last-known rotation, not
++    /// flash back to 0 — and arms the write-through for every later update.
++    pub fn attach_peer_orientation_cell(&mut self, cell: Option<Arc<AtomicU8>>) {
++        if let Some(cell) = cell {
++            self.peer_video_orientation = cell.load(Ordering::Relaxed) & 0x03;
++            self.peer_orientation_cell = Some(cell);
++        }
+     }
+ 
+     /// Record orientation for one authenticated group participant/device.
+@@ -5364,6 +5391,41 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn peer_orientation_survives_engine_rebuild() {
++        use portable_atomic::AtomicU8;
++        use std::sync::Arc;
++        use std::sync::atomic::Ordering;
++
++        // The registry's cell outlives any one engine: engine 1 learns the peer rotated to 2 and
++        // writes through, so the rebuilt engine 2 seeds 2 instead of 0 — the peer camera
++        // off→on rebuild used to flash the incoming video CW-90.
++        let cell = Arc::new(AtomicU8::new(0));
++        let mut eng1 = engine(true);
++        eng1.attach_peer_orientation_cell(Some(Arc::clone(&cell)));
++        eng1.set_peer_video_orientation(2);
++        assert_eq!(cell.load(Ordering::Relaxed), 2);
++
++        // Media plane rebuilds (peer stop→start, same call + generation) → engine 2 seeds from
++        // the cell, and keeps stamping it on inbound AUs.
++        let mut eng2 = engine(true);
++        eng2.attach_peer_orientation_cell(Some(Arc::clone(&cell)));
++        assert_eq!(eng2.peer_video_orientation(), 2);
++        assert!(eng2.enable_video());
++        eng2.start(0, 0);
++        let _ = drain(&mut eng2);
++
++        let mut peer = peer_video_pipe();
++        let packets = peer.protect_video(&video_au(100));
++        for p in &packets {
++            eng2.handle_input(1, Input::RelayPacket(p));
++        }
++        assert!(drain(&mut eng2).0.iter().any(|output| matches!(
++            output,
++            Output::VideoPlayout(VideoFrame { orientation: 2, .. })
++        )));
++    }
++
+     #[test]
+     fn mlow_red_payload_type_is_depacketized_before_toc_dispatch() {
+         let mut eng = engine(true);
+diff --git a/wacore/src/voip/registry.rs b/wacore/src/voip/registry.rs
+index d24a0cb3..aaad977e 100644
+--- a/wacore/src/voip/registry.rs
++++ b/wacore/src/voip/registry.rs
+@@ -242,6 +242,10 @@ struct CallEntry {
+     /// `VideoShared`, so the signaling handler's own `<video>` sends (upgrade answer / accept
+     /// announce) carry the consumer-set value.
+     device_orientation: Option<Arc<AtomicU8>>,
++    /// The peer's last-known `device_orientation` (90° steps 0..3), written through by the live
++    /// engine and seeded from by a rebuilt one — a media-plane rebuild must not flash the peer's
++    /// video back to rotation 0. Registry-owned so it outlives any one engine.
++    peer_video_orientation: Arc<AtomicU8>,
+     /// Lossless group roster/key transitions into the media driver.
+     group_ctl_tx: Option<GroupControlQueue>,
+     /// WARP authentication-tag width baked into the attached media pipelines. A relay refresh
+@@ -1442,6 +1446,7 @@ impl CallRegistry {
+             event_tx: None,
+             video_ctl_tx: None,
+             device_orientation: None,
++            peer_video_orientation: Arc::new(AtomicU8::new(0)),
+             group_ctl_tx: None,
+             group_warp_mi_tag_len: None,
+             pending_group_epoch: None,
+@@ -1818,6 +1823,50 @@ impl CallRegistry {
+             .unwrap_or(0)
+     }
+ 
++    /// Record the peer's last-known `device_orientation` (90° steps 0..3) so a rebuilt engine
++    /// seeds it instead of 0. Generation-guarded; no-op for an unknown call.
++    pub fn set_peer_video_orientation(&self, call_id: &str, generation: u64, orientation: u8) {
++        if let Some(entry) = self
++            .inner
++            .lock()
++            .expect("registry lock poisoned")
++            .get_mut(call_id)
++            && entry.generation == generation
++        {
++            entry
++                .peer_video_orientation
++                .store(orientation & 0x03, Ordering::Relaxed);
++        }
++    }
++
++    /// The peer's last-known `device_orientation` (90° steps 0..3); 0 before the peer signals one
++    /// or for an unknown call.
++    pub fn peer_video_orientation(&self, call_id: &str, generation: u64) -> u8 {
++        self.inner
++            .lock()
++            .expect("registry lock poisoned")
++            .get(call_id)
++            .filter(|entry| entry.generation == generation)
++            .map(|entry| entry.peer_video_orientation.load(Ordering::Relaxed))
++            .unwrap_or(0)
++    }
++
++    /// The peer-orientation cell to hand a [`CallEngine`] at attach: the engine seeds from it and
++    /// writes every later update through, so the last-known value outlives any one engine. `None`
++    /// for an unknown or stale call.
++    pub fn peer_video_orientation_cell(
++        &self,
++        call_id: &str,
++        generation: u64,
++    ) -> Option<Arc<AtomicU8>> {
++        self.inner
++            .lock()
++            .expect("registry lock poisoned")
++            .get(call_id)
++            .filter(|entry| entry.generation == generation)
++            .map(|entry| Arc::clone(&entry.peer_video_orientation))
++    }
++
+     /// Attach the group-media control sender for this call generation.
+     pub fn set_group_control_sender(
+         &self,
+@@ -4834,6 +4883,26 @@ mod tests {
+         assert!(reg.begin_local_video_request("CID", generation).is_some());
+     }
+ 
++    #[test]
++    fn peer_orientation_cell_is_generation_guarded() {
++        let reg = CallRegistry::new();
++        let generation = reg.insert(session("CID"));
++        assert_eq!(reg.peer_video_orientation("CID", generation), 0);
++        reg.set_peer_video_orientation("CID", generation, 2);
++        assert_eq!(reg.peer_video_orientation("CID", generation), 2);
++        // A stale or unknown call reads 0, never the current call's value.
++        assert_eq!(reg.peer_video_orientation("CID", generation + 1), 0);
++        assert_eq!(reg.peer_video_orientation("NOPE", generation), 0);
++        let cell = reg
++            .peer_video_orientation_cell("CID", generation)
++            .expect("cell for the current generation");
++        assert_eq!(cell.load(Ordering::Relaxed), 2);
++        assert!(
++            reg.peer_video_orientation_cell("CID", generation + 1)
++                .is_none()
++        );
++    }
++
+     #[test]
+     fn video_teardown_runs_after_registry_unlock() {
+         let reg = Arc::new(CallRegistry::new());
+-- 
+2.43.0
+

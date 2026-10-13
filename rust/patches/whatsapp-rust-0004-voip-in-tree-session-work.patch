@@ -1,0 +1,404 @@
+From 05c51eff6b23d852b669155dcadff01ffb90e02c Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:34:45 +0200
+Subject: [PATCH 4/5] voip: land in-tree session work (outbound orientation
+ cell, local_video_attached gate, signal_video_stopped, initiator ungate)
+
+Lands the uncommitted 2026-09-25..10-13 session work Task 3 of the
+calls resilience plan builds on:
+
+- Outbound device_orientation cell: VideoShared owns an Arc<AtomicU8>,
+  shared into the registry entry at registration
+  (set_device_orientation/device_orientation), and the signaling
+  handler's own <video> sends (upgrade answer / accept announce) read
+  it instead of hardcoding 0.
+- local_video_attached plane gate: set_video_channels installs a
+  teardown hook at registration for every call, so
+  begin_local_video_request must gate on the attached ENDPOINTS, not
+  video_teardown.is_some(); a pending peer request or a competing
+  local request also blocks a begin; stop_local_video releases the
+  peer's open request (its own timeout reaps the peer half).
+- CallHandle::signal_video_stopped: <video state=6> without tearing the
+  plane down, so the peer keeps rendering and a camera-on is just an
+  announce + media.
+- Video-upgrade initiator ungate experiment (2026-09-25 live session):
+  the initiator sends immediately instead of waiting for the peer's
+  UpgradeAccept.
+
+Task 3's peer-orientation cell (registry, engine, facade attach) is
+NOT in this commit.
+---
+ src/handlers/call.rs        |   8 ++-
+ src/voip/facade.rs          |  59 +++++++++++++---
+ wacore/src/voip/registry.rs | 136 +++++++++++++++++++++++++++++++++---
+ 3 files changed, 183 insertions(+), 20 deletions(-)
+
+diff --git a/src/handlers/call.rs b/src/handlers/call.rs
+index 07b6a64f..84a2ebdf 100644
+--- a/src/handlers/call.rs
++++ b/src/handlers/call.rs
+@@ -850,7 +850,9 @@ impl StanzaHandler for CallHandler {
+                                             call_creator: call.action.call_creator(),
+                                             state: VideoState::UpgradeAccept,
+                                             dec: Some("H264,AV1"),
+-                                            device_orientation: Some(0),
++                                            device_orientation: Some(
++                                                registry.device_orientation(call_id, generation),
++                                            ),
+                                         });
+                                         if let Err(e) = client.send_node(accept).await {
+                                             warn!(
+@@ -867,7 +869,9 @@ impl StanzaHandler for CallHandler {
+                                             call_creator: call.action.call_creator(),
+                                             state: VideoState::Enabled,
+                                             dec: Some("H264"),
+-                                            device_orientation: Some(0),
++                                            device_orientation: Some(
++                                                registry.device_orientation(call_id, generation),
++                                            ),
+                                         });
+                                         if let Err(e) = client.send_node(enabled).await {
+                                             warn!(
+diff --git a/src/voip/facade.rs b/src/voip/facade.rs
+index a8f0e691..239cb758 100644
+--- a/src/voip/facade.rs
++++ b/src/voip/facade.rs
+@@ -7,9 +7,11 @@
+ use std::future::Future;
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Duration;
+ 
++use portable_atomic::AtomicU8;
++
+ use bytes::Bytes;
+ use log::warn;
+ use wacore::message_processing::EncType;
+@@ -1797,6 +1799,7 @@ async fn place_call(
+         video_shared.ctl_tx.clone(),
+         video_teardown_hook(&video_shared),
+     );
++    registry.set_device_orientation(&call_id, generation, video_shared.device_orientation_cell());
+ 
+     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
+     client
+@@ -2536,6 +2539,11 @@ async fn spawn_registered_call(
+         video_shared.ctl_tx.clone(),
+         video_teardown_hook(&video_shared),
+     );
++    registry.set_device_orientation(
++        &registration.call_id,
++        registration.generation,
++        video_shared.device_orientation_cell(),
++    );
+     attach_engine(
+         client,
+         &registration.call_id,
+@@ -2811,8 +2819,9 @@ pub(crate) struct VideoShared {
+     /// Receiver halves parked until `attach_engine` hands them to the drive loop.
+     receivers: std::sync::Mutex<Option<VideoReceivers>>,
+     /// This device's orientation in 90° steps (0..3), signaled in outbound `<video>` stanzas.
+-    /// Set by the consumer (from the camera sensor) before/at encode start.
+-    device_orientation: AtomicU8,
++    /// Set by the consumer (from the camera sensor) before/at encode start; the cell is shared
++    /// with the registry so the signaling handler's own `<video>` sends carry it too.
++    device_orientation: Arc<AtomicU8>,
+ }
+ 
+ /// The drive-loop halves of the video channels: (outbound AUs, plane control).
+@@ -2828,10 +2837,17 @@ impl VideoShared {
+             sink_slot: Arc::new(std::sync::Mutex::new(None)),
+             feed: std::sync::Mutex::new(None),
+             receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
+-            device_orientation: AtomicU8::new(0),
++            device_orientation: Arc::new(AtomicU8::new(0)),
+         }
+     }
+ 
++    /// The shared orientation cell, handed to the registry at registration so
++    /// the signaling handler's own `<video>` sends (upgrade answer / accept
++    /// announce) read the same value the consumer set on the handle.
++    fn device_orientation_cell(&self) -> Arc<AtomicU8> {
++        Arc::clone(&self.device_orientation)
++    }
++
+     /// The drive-loop halves. After the one real take (attach_engine), fresh closed channels are
+     /// returned defensively — their arms disable themselves in the driver.
+     fn take_receivers(&self) -> VideoReceivers {
+@@ -3454,6 +3470,28 @@ impl CallHandle {
+         Ok(())
+     }
+ 
++    /// Signal our camera OFF without leaving video mode: sends `<video state=6>` (Stopped) but
++    /// keeps the plane and the sink attached, so the peer's video keeps rendering and a later
++    /// camera-on is just `announce_video_enabled` + media. This is the WhatsApp model: the video
++    /// MODE is negotiated once; each camera is independent. (`stop_video` is the full teardown.)
++    pub async fn signal_video_stopped(&self) -> Result<(), CallError> {
++        self.ensure_current()?;
++        self.client_registry
++            .stop_local_video(&self.call_id, self.generation);
++        let client = self.upgrade_client()?;
++        let stanza = build_video_state(&VideoStateParams {
++            call_id: &self.call_id,
++            to: &self.peer_jid(),
++            id: &client.generate_request_id(),
++            call_creator: &self.call_creator,
++            state: VideoState::Stopped,
++            dec: None,
++            device_orientation: Some(self.device_orientation()),
++        });
++        client.send_node(stanza).await?;
++        Ok(())
++    }
++
+     /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
+     /// video plane down, and releases the source/sink. The peer may keep sending its direction;
+     /// audio is untouched. Idempotent.
+@@ -3568,11 +3606,16 @@ impl CallHandle {
+             }
+             return Err(CallError::Media("call no longer active"));
+         }
+-        // The upgrade INITIATOR holds outbound video until the peer accepts (the handler ungates on
+-        // the peer's UpgradeAccept/Enabled). The acceptor's peer already requested, so it may send
+-        // immediately.
++        // EXPERIMENT (2026-09-25 live session): the initiator used to gate outbound video until
++        // the peer's UpgradeAccept — but with the gate, the initiator's valid-H264 stream is never
++        // decoded by the official responder (PLI storm, no render, peer reverts after ~8 s), while
++        // the acceptor role (Enable from the start) decodes fine at the same peer. Ungate the
++        // initiator immediately to discriminate: if video then flows, the gate window / first-packet
++        // timing is the culprit; if not, the gap is handshake-side. Sending early costs a few AUs
++        // before the peer's state-4 — the engine drops nothing, the peer's demuxer simply joins on
++        // its first IDR.
+         let ctl = match role {
+-            VideoUpgradeRole::Initiate => VideoControl::EnableAwaitingAccept,
++            VideoUpgradeRole::Initiate => VideoControl::Enable,
+             VideoUpgradeRole::Accept(_) => VideoControl::Enable,
+         };
+         self.video.send_control(ctl);
+diff --git a/wacore/src/voip/registry.rs b/wacore/src/voip/registry.rs
+index 7cc6be6f..d24a0cb3 100644
+--- a/wacore/src/voip/registry.rs
++++ b/wacore/src/voip/registry.rs
+@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ use async_lock::Mutex as AsyncMutex;
+-use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
++use portable_atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
+ 
+ use crate::runtime::AbortHandle;
+ use crate::types::call::{CallAction, IncomingCall, VideoState};
+@@ -238,6 +238,10 @@ struct CallEntry {
+     event_tx: Option<CallEventQueue>,
+     /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
+     video_ctl_tx: Option<VideoControlSender>,
++    /// The call's outbound `device_orientation` cell (90° steps 0..3), shared with the facade's
++    /// `VideoShared`, so the signaling handler's own `<video>` sends (upgrade answer / accept
++    /// announce) carry the consumer-set value.
++    device_orientation: Option<Arc<AtomicU8>>,
+     /// Lossless group roster/key transitions into the media driver.
+     group_ctl_tx: Option<GroupControlQueue>,
+     /// WARP authentication-tag width baked into the attached media pipelines. A relay refresh
+@@ -249,6 +253,11 @@ struct CallEntry {
+     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
+     /// same teardown without keeping codec resources alive through lingering handles.
+     video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
++    /// Whether local video ENDPOINTS (source/sink) are attached. Distinct from
++    /// `video_teardown.is_some()`: `set_video_channels` installs a teardown hook at
++    /// registration for every call, audio included — the plane gate in
++    /// [`CallRegistry::begin_local_video_request`] must not read that as "video live".
++    local_video_attached: bool,
+     /// Prevents concurrent video transitions from overtaking each other while an ack is in flight.
+     event_publication_reserved: Arc<AtomicBool>,
+     /// Mirrors WA's stream mutex for user actions, peer signaling, and timeout callbacks.
+@@ -815,6 +824,7 @@ impl CallRegistry {
+             let video_teardown = if applied == GroupStateApply::Applied && downgrades_video {
+                 entry.video = VideoNegotiation::new(false);
+                 entry.session.is_video = false;
++                entry.local_video_attached = false;
+                 entry.video_teardown.take()
+             } else {
+                 None
+@@ -1431,10 +1441,12 @@ impl CallRegistry {
+             rekey_tx: None,
+             event_tx: None,
+             video_ctl_tx: None,
++            device_orientation: None,
+             group_ctl_tx: None,
+             group_warp_mi_tag_len: None,
+             pending_group_epoch: None,
+             video_teardown: None,
++            local_video_attached: false,
+             event_publication_reserved: Arc::new(AtomicBool::new(false)),
+             video_transition_lock: Arc::new(AsyncMutex::new(())),
+             group_transition_lock: Arc::new(AsyncMutex::new(())),
+@@ -1778,6 +1790,34 @@ impl CallRegistry {
+         }
+     }
+ 
++    /// Share the call's outbound `device_orientation` cell (90° steps 0..3)
++    /// with the signaling handler, whose own `<video>` sends read it.
++    /// Generation-guarded; no-op for an unknown call.
++    pub fn set_device_orientation(&self, call_id: &str, generation: u64, cell: Arc<AtomicU8>) {
++        if let Some(entry) = self
++            .inner
++            .lock()
++            .expect("registry lock poisoned")
++            .get_mut(call_id)
++            && entry.generation == generation
++        {
++            entry.device_orientation = Some(cell);
++        }
++    }
++
++    /// The call's outbound `device_orientation` (90° steps 0..3); 0 before a
++    /// consumer sets it or for an unknown call.
++    pub fn device_orientation(&self, call_id: &str, generation: u64) -> u8 {
++        self.inner
++            .lock()
++            .expect("registry lock poisoned")
++            .get(call_id)
++            .filter(|entry| entry.generation == generation)
++            .and_then(|entry| entry.device_orientation.as_deref())
++            .map(|cell| cell.load(Ordering::Relaxed))
++            .unwrap_or(0)
++    }
++
+     /// Attach the group-media control sender for this call generation.
+     pub fn set_group_control_sender(
+         &self,
+@@ -2081,18 +2121,24 @@ impl CallRegistry {
+             return false;
+         };
+         entry.video_teardown = Some(video_teardown);
++        entry.local_video_attached = true;
+         true
+     }
+ 
+     /// Release the local video endpoints once for the current call generation.
+     pub fn run_video_teardown(&self, call_id: &str, generation: u64) -> bool {
+-        let hook = self
+-            .inner
+-            .lock()
+-            .expect("registry lock poisoned")
+-            .get_mut(call_id)
+-            .filter(|entry| entry.generation == generation)
+-            .and_then(|entry| entry.video_teardown.take());
++        let hook = {
++            let mut map = self.inner.lock().expect("registry lock poisoned");
++            let entry = match map
++                .get_mut(call_id)
++                .filter(|entry| entry.generation == generation)
++            {
++                Some(entry) => entry,
++                None => return false,
++            };
++            entry.local_video_attached = false;
++            entry.video_teardown.take()
++        };
+         if let Some(hook) = hook {
+             hook();
+             true
+@@ -2302,11 +2348,27 @@ impl CallRegistry {
+         let entry = map
+             .get_mut(call_id)
+             .filter(|entry| entry.generation == generation)?;
+-        if !entry.video.self_state.is_inactive_for_call_mode()
+-            || entry.video.pending_peer_request.is_some()
++        // A pending peer request must be answered (accept/decline), never raced
++        // with a competing local request.
++        if entry.video.pending_peer_request.is_some() {
++            return None;
++        }
++        // One local request at a time — a second begin would orphan the first
++        // epoch's timeout.
++        if entry.video.self_state.is_upgrade_request() || entry.video.pending_self_request.is_some()
+         {
+             return None;
+         }
++        // `self_state == Enabled` does not imply a direction is being sent: a
++        // video-from-start registration (`VideoNegotiation::new(true)`) and a
++        // silent audio-only answer of a video offer both leave `Enabled` with
++        // no local plane. Gate on the attached endpoints (`local_video_attached`,
++        // NOT `video_teardown.is_some()` — `set_video_channels` installs a
++        // teardown hook at registration for every call, audio included), so the
++        // user's toggle can always open a direction that is not actually live.
++        if entry.local_video_attached {
++            return None;
++        }
+         entry.video.self_state = VideoState::UpgradeRequestV2;
+         let epoch = entry.video.next_self_request();
+         entry.session.is_video = entry.video.is_video();
+@@ -2396,6 +2458,11 @@ impl CallRegistry {
+         };
+         entry.video.self_state = VideoState::Stopped;
+         entry.video.pending_self_request = None;
++        // Our decline/stop also ends the peer's open request from our side of
++        // the negotiation: leaving it pending would block every later
++        // `begin_local_video_request` even though no request can ever be
++        // answered against it (the peer's own timeout reaps its half).
++        entry.video.pending_peer_request = None;
+         entry.session.is_video = entry.video.is_video();
+         true
+     }
+@@ -4718,6 +4785,55 @@ mod tests {
+         assert!(!reg.snapshot("CID").expect("session").is_video);
+     }
+ 
++    #[test]
++    fn begin_request_allowed_while_enabled_without_a_local_plane() {
++        // A video-from-start registration seeds self_state=Enabled
++        // (VideoNegotiation::new(true)); a silent audio-only answer of a video
++        // offer leaves the same shape. Neither sends video, so a later
++        // user-initiated upgrade must be allowed.
++        let reg = CallRegistry::new();
++        let mut video_session = session("CID");
++        video_session.is_video = true;
++        let generation = reg.insert(video_session);
++        assert!(reg.begin_local_video_request("CID", generation).is_some());
++    }
++
++    #[test]
++    fn begin_request_rejected_while_the_plane_is_attached() {
++        let reg = CallRegistry::new();
++        let generation = reg.insert(session("CID"));
++        // set_video_channels runs at registration for every call (audio
++        // included) and installs a teardown hook — it must NOT read as a
++        // live plane. Only the endpoint attach (set_video_teardown) does.
++        let (event_tx, _event_rx) = async_channel::bounded(1);
++        let (ctl_tx, _ctl_rx) = video_control_channel();
++        reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
++        assert!(reg.begin_local_video_request("CID", generation).is_some());
++        assert!(reg.end_local_video_request("CID", generation, 1));
++
++        reg.set_video_teardown("CID", generation, Box::new(|| {}));
++        assert!(
++            reg.begin_local_video_request("CID", generation).is_none(),
++            "the plane is live; a second request would orphan its endpoints"
++        );
++        assert!(reg.run_video_teardown("CID", generation));
++        assert!(reg.begin_local_video_request("CID", generation).is_some());
++    }
++
++    #[test]
++    fn stopping_local_video_releases_a_pending_peer_request() {
++        // A decline/stop answers the peer's prompt from our side; leaving the
++        // request pending would block every later local upgrade.
++        let reg = CallRegistry::new();
++        let generation = reg.insert(session("CID"));
++        match reg.apply_peer_video_state("CID", generation, VideoState::UpgradeRequestV2) {
++            PeerVideoTransition::UpgradeRequested(_) => {}
++            transition => panic!("unexpected transition: {transition:?}"),
++        }
++        assert!(reg.stop_local_video("CID", generation));
++        assert!(reg.begin_local_video_request("CID", generation).is_some());
++    }
++
+     #[test]
+     fn video_teardown_runs_after_registry_unlock() {
+         let reg = Arc::new(CallRegistry::new());
+-- 
+2.43.0
+
