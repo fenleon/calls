@@ -1,0 +1,128 @@
+From bfcf5b4c4d45fbe1ffacb94b0a06ff61a3da548c Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:29:18 +0200
+Subject: [PATCH] voip: facade test pins our camera off->on media re-arm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Task 4 of the calls resilience plan, steps 1/2: the brief's hypothesis
+(engine-side video_tx consumer dropped on our signal_video_stopped) is
+disproven — this facade-level test drives a real spawned call through
+start_video -> signal_video_stopped -> announce_video_enabled and
+asserts fresh AUs still reach the engine as PT-97 transmits. It passes,
+so the off→on failure lives one layer up: the Kotlin engine's async
+video transitions race (stopVideo's VideoLink.stop() join delays the
+Stopped stanza behind a quick re-enable's Enabled announce — the peer
+then renders our direction as stopped and ignores the still-flowing
+stream until its own video cycle rebuilds its render).
+
+Also covers the initiator-ungate experiment's plane lifecycle: the
+Enable from begin_video is never undone by our own Stopped signaling.
+---
+ src/voip/facade.rs | 89 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/src/voip/facade.rs b/src/voip/facade.rs
+index c78e139a..15fe4fb1 100644
+--- a/src/voip/facade.rs
++++ b/src/voip/facade.rs
+@@ -8435,6 +8435,95 @@ mod tests {
+         handle.hangup().await;
+     }
+ 
++    // Task 4 (resilience plan): OUR camera off→on must resume outbound video with no peer-side
++    // state change. The real Kotlin flow is `signal_video_stopped` (mode kept, plane kept) then
++    // `announce_video_enabled` + fresh AUs through the SAME source channel; the drive loop must
++    // put them on the wire again. Today the stream only comes back after the PEER cycles video
++    // (their 6→1 lands as an Enable control) — this test pins whichever layer drops the re-arm.
++    #[tokio::test]
++    async fn video_source_rearms_after_stop_and_announce() {
++        let (client, _signaling_sends) = make_sending_client().await;
++        let (_relay_tx, relay_rx) = async_channel::unbounded();
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let factory = MockFactory {
++            sent: sent.clone(),
++            relay_rx: Mutex::new(Some(relay_rx)),
++            connects: Arc::new(AtomicUsize::new(0)),
++        };
++        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
++        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
++        let handle = spawn_call(
++            &client,
++            mk_session(),
++            engine(),
++            &factory,
++            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
++            None,
++        )
++        .await
++        .expect("spawn_call");
++
++        // Outbound RTP with payload type 97 (H.264): byte 0 = V2 marker, byte 1 low 7 bits = PT.
++        let media_packets = |sent: &Arc<Mutex<Vec<Bytes>>>| -> usize {
++            sent.lock()
++                .unwrap()
++                .iter()
++                .filter(|p| {
++                    let p = p.as_ref();
++                    p.len() >= 2 && p[0] & 0xC0 == 0x80 && p[1] & 0x7F == 97
++                })
++                .count()
++        };
++        // Yield to the runtime while polling: the drive loop's tasks share this test's
++        // current-thread runtime, so a blocking sleep would starve them.
++        let wait_for_media = |sent: Arc<Mutex<Vec<Bytes>>>, baseline: usize, timeout: Duration| async move {
++            let deadline = tokio::time::Instant::now() + timeout;
++            while tokio::time::Instant::now() < deadline {
++                if media_packets(&sent) > baseline {
++                    return true;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++            media_packets(&sent) > baseline
++        };
++
++        let (au_tx, au_rx) = async_channel::unbounded::<Vec<u8>>();
++        let (frame_tx, _frame_rx) = async_channel::unbounded::<VideoFrame>();
++        let source = TimedVideoSource {
++            frames: au_rx,
++            timestamp_stride: 4500,
++        };
++        handle
++            .start_video(source, frame_tx)
++            .await
++            .expect("start_video");
++
++        let mut au = vec![0, 0, 0, 1, 0x65];
++        au.extend((0..3000usize).map(|i| (i % 251) as u8));
++
++        // Streaming works before the camera toggle.
++        au_tx.try_send(au.clone()).unwrap();
++        assert!(
++            wait_for_media(sent.clone(), 0, Duration::from_secs(2)).await,
++            "AUs must reach the engine while the camera is on"
++        );
++        let before_stop = media_packets(&sent);
++
++        // Camera off (mode kept), then on: the exact two calls Kotlin makes.
++        handle.signal_video_stopped().await.expect("signal stopped");
++        handle
++            .announce_video_enabled()
++            .await
++            .expect("announce enabled");
++
++        au_tx.try_send(au).unwrap();
++        assert!(
++            wait_for_media(sent.clone(), before_stop, Duration::from_secs(2)).await,
++            "AUs must reach the engine again after OUR OWN off→on (no peer cycle)"
++        );
++        handle.hangup().await;
++    }
++
+     #[tokio::test]
+     async fn start_video_rejects_audio_group_before_attaching() {
+         let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
+-- 
+2.43.0
+

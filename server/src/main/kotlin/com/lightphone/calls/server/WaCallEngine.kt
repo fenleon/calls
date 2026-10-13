@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicInteger
 
 /** UI reduction of the wire's `<video state=N>` ints (the library's
@@ -132,6 +134,14 @@ object WaCallEngine : WaListener {
      *  render). */
     @Volatile
     private var videoMode = false
+
+    /** Serializes OUR-direction `<video>` signaling (state 1/6 stanzas): a
+     *  quick camera off→on races the stop half's `VideoLink.stop()` join
+     *  (up to ~1 s) against the start half's announce on the IO pool, and a
+     *  Stopped landing AFTER the Enabled makes the peer render our direction
+     *  as stopped — our AUs keep flowing but the peer shows nothing until
+     *  its own video cycle rebuilds its render (2026-10-13 report). */
+    private val videoSignalLock = Mutex()
 
     /** Auto-restarts since the last successful pairing — caps the watchdog /
      *  unlink respawn loop when recovery is hopeless. */
@@ -729,9 +739,11 @@ object WaCallEngine : WaListener {
                     // toggles it.
                     3, 11 -> if (event.upgrade != null) scope.launch {
                         val ok = runCatching {
-                            bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
-                            bridgeOrThrow().acceptVideo(event.upgrade!!, videoTier.fps.toUInt())
-                            bridgeOrThrow().announceVideoEnabled()
+                            videoSignalLock.withLock {
+                                bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
+                                bridgeOrThrow().acceptVideo(event.upgrade!!, videoTier.fps.toUInt())
+                                bridgeOrThrow().announceVideoEnabled()
+                            }
                         }.onFailure { Log.w(TAG, "video auto-accept failed: ${it.message}") }
                             .isSuccess
                         if (ok) {
@@ -884,18 +896,22 @@ object WaCallEngine : WaListener {
     /** Starts our video direction (mid-call upgrade we initiate): the
      *  bridge's fps-paced media plane plus the local encoder. */
     fun startVideo() {
+        // Captured synchronously: tap order must be epoch order, or a fast
+        // off→on could hand the fresher epoch to the stale stop.
+        val epoch = ++videoEpoch
         scope.launch {
-            val epoch = ++videoEpoch
             try {
-                bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
-                if (videoMode) {
-                    // Camera-on inside an open video mode: no new upgrade —
-                    // announce the direction and stream. (A second
-                    // `start_video` is refused by the registry: the plane is
-                    // already attached.)
-                    bridgeOrThrow().announceVideoEnabled()
-                } else {
-                    bridgeOrThrow().startVideo(videoTier.fps.toUInt())
+                videoSignalLock.withLock {
+                    bridgeOrThrow().setVideoOrientation(videoOrientationSignal())
+                    if (videoMode) {
+                        // Camera-on inside an open video mode: no new upgrade —
+                        // announce the direction and stream. (A second
+                        // `start_video` is refused by the registry: the plane is
+                        // already attached.)
+                        bridgeOrThrow().announceVideoEnabled()
+                    } else {
+                        bridgeOrThrow().startVideo(videoTier.fps.toUInt())
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "startVideo failed: ${e.message}")
@@ -938,8 +954,15 @@ object WaCallEngine : WaListener {
             // when the mode itself never existed (a plain audio call where
             // the toggle opened it and the user closed it before anyone
             // accepted).
-            runCatching {
-                if (mode) bridge?.signalVideoStopped() else bridge?.stopVideo()
+            videoSignalLock.withLock {
+                // A newer toggle owns the direction signaling: its Enabled
+                // already (re-)announced our camera, and a late Stopped here
+                // would land AFTER it and blank the peer's render of our
+                // stream (the 2026-10-13 off→on regression).
+                if (videoEpoch != epoch) return@launch
+                runCatching {
+                    if (mode) bridge?.signalVideoStopped() else bridge?.stopVideo()
+                }
             }
             if (!mode) stopVideoDecoding()
         }
@@ -981,8 +1004,21 @@ object WaCallEngine : WaListener {
         // now, while the grant is in hand (Android 14 while-in-use rule).
         appContext?.let { WaCallService.elevateToCamera(it) }
         var created: VideoLink? = null
+        // One-shot per encode link: the bridge only errors with no-call/closed
+        // channel (call ended under the encoder), so after the first WARN the
+        // per-frame repeats carry no new information (battery rule).
+        var auSendFailureLogged = false
         val link = VideoLink(
-            sink = { au -> runCatching { bridge.sendVideoAu(au) }.getOrDefault(false) },
+            sink = { au ->
+                runCatching { bridge.sendVideoAu(au) }
+                    .onFailure {
+                        if (!auSendFailureLogged) {
+                            auSendFailureLogged = true
+                            Log.w(TAG, "video AU send failed: ${it.message}")
+                        }
+                    }
+                    .getOrDefault(false)
+            },
             dumpFile = if (videoAuDump) {
                 java.io.File(appContextForVideoLink().filesDir, "video-au-dump.h264")
             } else null,
