@@ -1,0 +1,88 @@
+From d64f1a4ddc4d3c449159a235d5f84688b1e3fa5d Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:43:37 +0200
+Subject: [PATCH 8/8] voip: carry peer orientation across same-call re-offer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A same-call-id re-offer REPLACES the registry entry, and the fresh
+entry started with a peer_video_orientation cell of 0 — a rotation the
+peer signaled before the re-offer was forgotten and the video came in
+rotated. insert_inner now carries the old entry's last-known value into
+the new cell (cells stay per-entry), with a one-shot INFO marker when a
+non-zero orientation is carried.
+---
+ wacore/src/voip/registry.rs | 48 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/wacore/src/voip/registry.rs b/wacore/src/voip/registry.rs
+index aaad977e..5a19e198 100644
+--- a/wacore/src/voip/registry.rs
++++ b/wacore/src/voip/registry.rs
+@@ -1373,11 +1373,23 @@ impl CallRegistry {
+             self.take_ringing(&session.call_id);
+         }
+         let prev = {
++            let call_id = session.call_id.clone();
+             let mut map = self.inner.lock().expect("registry lock poisoned");
+-            map.insert(
+-                session.call_id.clone(),
+-                Self::new_entry(session, generation, force_group, is_call_link),
+-            )
++            // A same-call-id re-offer replaces the registration but the call itself continues:
++            // carry the old entry's last-known peer orientation into the fresh cell so the
++            // replacement engine (which seeds from it) doesn't flash back to unrotated.
++            let carried = map
++                .get(&call_id)
++                .map(|prev| prev.peer_video_orientation.load(Ordering::Relaxed))
++                .unwrap_or(0);
++            let entry = Self::new_entry(session, generation, force_group, is_call_link);
++            if carried != 0 {
++                entry
++                    .peer_video_orientation
++                    .store(carried, Ordering::Relaxed);
++                log::info!("voip: re-offer replaced entry, carrying peer orientation={carried}");
++            }
++            map.insert(call_id, entry)
+         };
+         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
+         // on_terminal hook fires (the old generation ended). Running those closures off-lock keeps them
+@@ -4903,6 +4915,34 @@ mod tests {
+         );
+     }
+ 
++    // A same-call-id re-offer REPLACES the registration (fresh cells), but the peer's last-known
++    // rotation must survive: the re-offer aborts the old media task while the call itself
++    // continues, and the replacement engine seeds its orientation from the carried cell.
++    #[test]
++    fn reoffer_replaces_entry_but_carries_peer_orientation() {
++        let reg = CallRegistry::new();
++        let first = reg.insert(session("CID"));
++        reg.set_peer_video_orientation("CID", first, 2);
++
++        let second = reg.insert(session("CID"));
++        assert_ne!(second, first, "a re-offer must mint a new generation");
++        assert_eq!(
++            reg.peer_video_orientation("CID", second),
++            2,
++            "the replacement entry must carry the old entry's peer orientation"
++        );
++        // The old generation's entry (and its cell) is gone with the replacement.
++        assert!(reg.peer_video_orientation_cell("CID", first).is_none());
++
++        // An unrelated call-id starts clean, and so does a re-offer of a call whose peer never
++        // signaled an orientation.
++        assert_eq!(reg.peer_video_orientation("OTHER", second), 0);
++        let other_first = reg.insert(session("FRESH"));
++        let other_second = reg.insert(session("FRESH"));
++        assert_eq!(reg.peer_video_orientation("FRESH", other_second), 0);
++        assert_ne!(other_second, other_first);
++    }
++
+     #[test]
+     fn video_teardown_runs_after_registry_unlock() {
+         let reg = Arc::new(CallRegistry::new());
+-- 
+2.43.0
+

@@ -1,0 +1,419 @@
+From 80eb4aab18ee63b90610710a29be09575a8e86e1 Mon Sep 17 00:00:00 2001
+From: fenleon <fenleon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:43:30 +0200
+Subject: [PATCH 7/8] voip: reply to peer re-ICE with relay rebuild (1:1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A mid-call network switch made the peer re-ICE
+(<transport transport-message-type="3">); we ignored it and the peer
+gave up ~5s later, with our video degraded permanently — our own relay
+socket had died with the old network and nothing rebuilt it.
+
+The handler now answers an active 1:1 call's re-ICE with the type-9
+transport reply (build_transport) and pokes the media engine through
+the video-control plumbing (VideoControl::RebuildRelay ->
+eng.rebuild_relay), which mirrors the group relay-refresh tail of
+commit_group_allocate: retire the transport, redial the stored relay
+endpoint, re-allocate on the same credentials, arm the response budget
+in relay_reconnected. The driver's existing ReconnectRelay arm does the
+redial, so no watchdog or per-packet logging — one-shot INFO markers
+only (battery rule).
+---
+ src/handlers/call.rs      | 169 +++++++++++++++++++++++++++++++++++++-
+ wacore/src/voip/driver.rs |  61 ++++++++++++++
+ wacore/src/voip/engine.rs |  83 +++++++++++++++++++
+ 3 files changed, 312 insertions(+), 1 deletion(-)
+
+diff --git a/src/handlers/call.rs b/src/handlers/call.rs
+index 1123b4e7..55fac3d4 100644
+--- a/src/handlers/call.rs
++++ b/src/handlers/call.rs
+@@ -10,7 +10,8 @@ use wacore::messages::MessageUtils;
+ use wacore::stanza::call::{
+     REJECT_REASON_BUSY, TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
+-    VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
++    TransportParams, VideoStateParams, build_call_video_ack, build_terminate, build_transport,
++    build_video_state,
+ };
+ use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
+ use wacore::stanza::group_call::build_call_control_ack;
+@@ -669,6 +670,44 @@ impl StanzaHandler for CallHandler {
+                                 dispatch_call = false;
+                             }
+                         }
++                        CallAction::Transport {
++                            call_id,
++                            call_creator,
++                            p2p_cand_round,
++                            transport_message_type,
++                        } if transport_message_type.as_deref() == Some("3") => {
++                            // Peer re-ICE (a network switch, either side): the peer re-announces
++                            // its candidates and expects a type-9 reply, and our own relay path
++                            // needs a rebuild if OUR socket died with the old network. Ignoring
++                            // this is fatal — the peer gives up ~5s later. Peer-driven only; no
++                            // keepalive watchdog. One-shot INFO markers (battery rule).
++                            let registry = client.call_registry();
++                            if let Some(generation) = registry.generation_of(call_id)
++                                && !registry.is_group_call(call_id)
++                            {
++                                log::info!(
++                                    "voip: peer re-ICE, rebuilding relay path for {call_id}"
++                                );
++                                let reply = build_transport(&TransportParams {
++                                    call_id,
++                                    to: &call.from,
++                                    call_creator,
++                                    p2p_cand_round: p2p_cand_round.as_deref(),
++                                    transport_message_type: Some("9"),
++                                    relay_te: None,
++                                });
++                                if let Err(error) = client.send_node(reply).await {
++                                    warn!(
++                                        "call: failed to reply to peer re-ICE for {call_id}: {error}"
++                                    );
++                                }
++                                registry.send_video_ctl(
++                                    call_id,
++                                    generation,
++                                    VideoControl::RebuildRelay,
++                                );
++                            }
++                        }
+                         _ => {}
+                     }
+                     // In-call <video state> signaling: send the TYPED ack (`type="video"`) and
+@@ -3514,6 +3553,134 @@ mod tests {
+         );
+     }
+ 
++    // Peer re-ICE on an ACTIVE 1:1 call (network switch): the peer expects a type-9 transport
++    // reply, and our own relay path must be rebuilt — ignoring the re-ICE is fatal (the peer
++    // gives up ~5s later). Regression for the on-device mid-call network-toggle wedge.
++    #[cfg(feature = "voip-runtime")]
++    #[tokio::test]
++    async fn peer_reice_on_active_call_replies_and_rebuilds_relay() {
++        use wacore::voip::VideoControl;
++
++        let client = make_sending_client().await;
++        let registry = client.call_registry();
++        let session = wacore::voip::CallSession::new_incoming(
++            "CALL-ID-0001",
++            fake_caller_lid(),
++            fake_caller_lid(),
++        );
++        let generation = registry.insert(session);
++        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
++        let (ctl_tx, ctl_rx) = video_control_channel();
++        registry.set_video_channels("CALL-ID-0001", generation, ev_tx, ctl_tx, Box::new(|| {}));
++        let reply_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
++
++        let stanza = NodeBuilder::new("call")
++            .attr("from", fake_caller_lid())
++            .attr("id", "STANZA-REICE")
++            .attr("t", "1766847151")
++            .children([NodeBuilder::new("transport")
++                .attr("call-creator", fake_caller_lid())
++                .attr("call-id", "CALL-ID-0001")
++                .attr("transport-message-type", "3")
++                .build()])
++            .build();
++        let mut cancelled = false;
++        assert!(
++            CallHandler
++                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
++                .await
++        );
++
++        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply_waiter)
++            .await
++            .expect("the type-9 transport reply must be sent")
++            .expect("waiter");
++        let reply_ref = reply.as_node_ref();
++        let children = reply_ref.children().expect("transport child");
++        let transport = &children[0];
++        assert_eq!(transport.tag, "transport");
++        assert_eq!(
++            transport
++                .attrs()
++                .optional_string("transport-message-type")
++                .as_deref(),
++            Some("9"),
++            "a peer re-ICE (type 3) is answered with a type-9 transport reply"
++        );
++        assert_eq!(
++            transport.attrs().optional_string("call-id").as_deref(),
++            Some("CALL-ID-0001")
++        );
++        let net = transport.get_optional_child("net").expect("net child");
++        assert!(
++            net.attrs().optional_string("protocol").is_none(),
++            "a type-9 reply omits the net protocol attribute"
++        );
++
++        let ctls: Vec<VideoControl> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
++        assert!(
++            ctls.contains(&VideoControl::RebuildRelay),
++            "the media engine must be poked to rebuild the relay path"
++        );
++        registry.remove_if_current("CALL-ID-0001", generation);
++    }
++
++    // The group path keeps its own relay refresh machinery: a transport type-3 on a group call
++    // must NOT produce the 1:1 type-9 reply nor poke the 1:1 video control plane.
++    #[cfg(feature = "voip-runtime")]
++    #[tokio::test]
++    async fn peer_reice_on_group_call_keeps_the_group_path() {
++        use wacore::voip::VideoControl;
++
++        let client = make_sending_client().await;
++        let registry = client.call_registry();
++        let creator = fake_caller_lid();
++        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
++            "GROUP-CALL",
++            Jid::new("GROUP-CALL", Server::Call),
++            creator.clone(),
++        ));
++        assert!(registry.is_group_call("GROUP-CALL"));
++        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
++        let (ctl_tx, ctl_rx) = video_control_channel();
++        registry.set_video_channels("GROUP-CALL", generation, ev_tx, ctl_tx, Box::new(|| {}));
++        let reply_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
++
++        let stanza = NodeBuilder::new("call")
++            .attr("from", Jid::new("GROUP-CALL", Server::Call))
++            .attr("id", "STANZA-GROUP-REICE")
++            .attr("t", "1766847151")
++            .children([NodeBuilder::new("transport")
++                .attr("call-creator", creator)
++                .attr("call-id", "GROUP-CALL")
++                .attr("transport-message-type", "3")
++                .build()])
++            .build();
++        let mut cancelled = false;
++        assert!(
++            CallHandler
++                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
++                .await
++        );
++
++        // A matching send always resolves the waiter with the node; Elapsed or a canceled
++        // waiter both mean no call-tag stanza went out.
++        if let Ok(Ok(node)) =
++            tokio::time::timeout(std::time::Duration::from_millis(500), reply_waiter).await
++        {
++            panic!(
++                "a group call must not get the 1:1 type-9 transport reply; sent: {:?}",
++                node.as_node_ref()
++            );
++        }
++        let ctls: Vec<VideoControl> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
++        assert!(
++            !ctls.contains(&VideoControl::RebuildRelay),
++            "group relay refresh stays on the group roster path"
++        );
++        registry.remove_if_current("GROUP-CALL", generation);
++    }
++
+     // A peer that REJECTS or CANCELS an upgrade we started must fully release our local video: the
+     // registered teardown hook runs (so the camera feed stops) and the session flag clears.
+     #[cfg(feature = "voip-runtime")]
+diff --git a/wacore/src/voip/driver.rs b/wacore/src/voip/driver.rs
+index 8a5725cd..203ae266 100644
+--- a/wacore/src/voip/driver.rs
++++ b/wacore/src/voip/driver.rs
+@@ -157,6 +157,9 @@ pub enum VideoControl {
+         participant: wacore_binary::Jid,
+         orientation: u8,
+     },
++    /// Peer re-ICE on a 1:1 call (network switch): rebuild the relay path. The engine emits the
++    /// reconnect intent; the existing `ReconnectRelay` output arm redials and re-allocates.
++    RebuildRelay,
+ }
+ 
+ /// State changes stay FIFO so `Disable` performs its purge before a later `Enable`; only the latest
+@@ -1012,6 +1015,9 @@ async fn run_call_with_clock_and_wallclock(
+             relay_events = replacement_events;
+             disconnect_relay_bounded(&*rt, &*retired).await;
+             eng.relay_reconnected(now_ms());
++            // One-shot marker (battery rule): a relay path rebuild completed — peer re-ICE or a
++            // group relay refresh — never per-packet.
++            log::info!("voip: relay rebuilt");
+         }
+ 
+         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
+@@ -1286,6 +1292,7 @@ async fn run_call_with_clock_and_wallclock(
+                         participant,
+                         orientation,
+                     }) => eng.set_participant_video_orientation(participant, orientation),
++                    Ok(VideoControl::RebuildRelay) => eng.rebuild_relay(),
+                     Err(_) => video_ctl_open = false,
+                 }
+                 // Fire an overdue timer like the other ready arms so a stream of control messages
+@@ -1908,6 +1915,60 @@ mod tests {
+         );
+     }
+ 
++    // A peer re-ICE (network switch) on a 1:1 call must redial the relay transport and bind the
++    // replacement with a fresh allocate, through the same VideoControl plumbing as the rest of
++    // the mid-call plane. The replacement's pending Disconnected ends the drive loop.
++    #[test]
++    fn rebuild_relay_control_redials_transport_and_reallocates() {
++        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
++        let replacement = Arc::new(RecordingTransport::default());
++        let (replacement_tx, replacement_rx) = async_channel::unbounded();
++        replacement_tx
++            .try_send(RelayTransportEvent::Disconnected(
++                RelayDisconnectReason::Closed,
++            ))
++            .unwrap();
++        let transport = Arc::new(ReconnectTransport {
++            sent: Mutex::new(Vec::new()),
++            reconnects: Mutex::new(Vec::new()),
++            replacement: Mutex::new(Some((
++                replacement.clone() as Arc<dyn RelayTransport>,
++                replacement_rx,
++            ))),
++        });
++        let (_initial_tx, initial_rx) = async_channel::unbounded();
++        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
++        let (spk_tx, _spk_rx) = async_channel::unbounded();
++        let (ev_tx, _ev_rx) = async_channel::unbounded();
++        let (ctl_tx, ctl_rx) = video_control_channel();
++        assert!(ctl_tx.send(VideoControl::RebuildRelay));
++        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
++        channels.video_ctl = ctl_rx;
++
++        futures::executor::block_on(run_call(
++            rt,
++            transport.clone() as Arc<dyn RelayTransport>,
++            initial_rx,
++            channels,
++            CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap(),
++        ));
++
++        assert_eq!(
++            *transport.reconnects.lock().unwrap(),
++            ["203.0.113.7:3478".parse().unwrap()],
++            "the peer re-ICE must redial the configured relay endpoint"
++        );
++        assert!(
++            replacement
++                .sent
++                .lock()
++                .unwrap()
++                .iter()
++                .any(|packet| stun::stun_message_type(packet) == Some(stun::MSG_ALLOCATE_REQUEST)),
++            "the replacement transport must carry the fresh allocate"
++        );
++    }
++
+     #[test]
+     fn group_relay_migration_bounds_retired_transport_disconnect() {
+         let transport = HangingDisconnectTransport::default();
+diff --git a/wacore/src/voip/engine.rs b/wacore/src/voip/engine.rs
+index 213fc4b0..d1aa2040 100644
+--- a/wacore/src/voip/engine.rs
++++ b/wacore/src/voip/engine.rs
+@@ -1666,6 +1666,24 @@ impl CallEngine {
+         }
+     }
+ 
++    /// Peer-driven 1:1 relay rebuild (a re-ICE after a network switch): retire the transport and
++    /// re-allocate on the stored credentials. Mirrors the relay-refresh tail of
++    /// [`commit_group_allocate`] — the driver redials on `Output::ReconnectRelay`, sends the
++    /// retained allocate over the replacement channel, and `relay_reconnected` arms the response
++    /// budget once the new transport is up. Inert before `start` or after a terminal failure.
++    pub fn rebuild_relay(&mut self) {
++        if self.terminated || !self.started {
++            return;
++        }
++        self.allocated = false;
++        self.allocate_pending = true;
++        self.allocate_deadline = NEVER;
++        self.outbox
++            .push_back(Output::ReconnectRelay(self.relay_addr));
++        self.outbox
++            .push_back(Output::Transmit(self.allocate.clone()));
++    }
++
+     /// Start the deferred allocation-response budget once a replacement relay transport is ready.
+     pub(crate) fn relay_reconnected(&mut self, now: Millis) {
+         if self.started && self.allocate_pending && self.allocate_deadline == NEVER {
+@@ -3812,6 +3830,71 @@ mod encoded_tests {
+         );
+     }
+ 
++    fn one_to_one_engine() -> CallEngine {
++        CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap()
++    }
++
++    // A peer re-ICE on a 1:1 call (network switch) retires the relay path on the SAME
++    // credentials: the driver redials the stored endpoint, then the retained allocate binds the
++    // replacement socket. Mirrors the group relay-refresh tail of `commit_group_allocate`.
++    #[test]
++    fn one_to_one_rebuild_relay_redials_before_reallocating() {
++        let mut engine = one_to_one_engine();
++        engine.start(0, 1_700_000_000_000);
++        let _ = drain(&mut engine);
++        let success = allocation_success(&engine);
++        engine.handle_input(1, Input::RelayPacket(&success));
++        let _ = drain(&mut engine);
++        assert!(engine.is_allocated());
++
++        engine.rebuild_relay();
++
++        let outputs = drain(&mut engine);
++        let reconnect_index = outputs
++            .iter()
++            .position(|output| {
++                matches!(output, Output::ReconnectRelay(endpoint) if *endpoint == engine.relay_addr)
++            })
++            .expect("reconnect intent on the configured relay endpoint");
++        let allocate_index = outputs
++            .iter()
++            .position(|output| matches!(output, Output::Transmit(_)))
++            .expect("replacement allocate");
++        assert!(
++            reconnect_index < allocate_index,
++            "the shell must redial before sending the replacement allocate"
++        );
++        assert!(
++            !engine.is_allocated(),
++            "the old allocation died with the retired socket"
++        );
++        assert_eq!(
++            engine.allocate_deadline, NEVER,
++            "the reconnect handshake must not consume the allocation response budget"
++        );
++        engine.relay_reconnected(14_000);
++        assert_ne!(
++            engine.allocate_deadline, NEVER,
++            "the replacement allocation retains its full response budget after reconnect"
++        );
++    }
++
++    #[test]
++    fn one_to_one_rebuild_relay_is_inert_before_start_or_after_terminal_failure() {
++        let mut engine = one_to_one_engine();
++        engine.rebuild_relay();
++        assert!(drain(&mut engine).is_empty(), "not started yet");
++
++        engine.start(0, 1_700_000_000_000);
++        let _ = drain(&mut engine);
++        engine.terminated = true;
++        engine.rebuild_relay();
++        assert!(
++            drain(&mut engine).is_empty(),
++            "a terminal engine emits nothing further"
++        );
++    }
++
+     #[test]
+     fn group_relay_tag_length_refresh_is_rejected_before_roster_commit() {
+         let mut engine = group_engine();
+-- 
+2.43.0
+
