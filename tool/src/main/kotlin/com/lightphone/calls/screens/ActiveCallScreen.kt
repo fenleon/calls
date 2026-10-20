@@ -1,6 +1,7 @@
 package com.lightphone.calls.screens
 
 import android.Manifest
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.view.Surface
 import android.view.TextureView
@@ -26,7 +27,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.viewinterop.AndroidView
@@ -78,6 +78,7 @@ class ActiveCallViewModel : LightViewModel<Unit>() {
 
     /** The video plane's reduced state + peer orientation (engine-owned). */
     val videoState = WaCallEngine.videoState
+    val peerVideoOn = WaCallEngine.peerVideoOn
     val peerOrientation = WaCallEngine.peerOrientation
     val peerFrameSize = WaCallEngine.peerFrameSize
 
@@ -202,6 +203,7 @@ class ActiveCallScreen(
         val fatal by viewModel.fatal.collectAsState()
         val bluetoothConnected by LightBluetooth.connected.collectAsState()
         val videoState by viewModel.videoState.collectAsState()
+        val peerVideoOn by viewModel.peerVideoOn.collectAsState()
         val orientation by viewModel.peerOrientation.collectAsState()
         // The peer stream's decoded size (decoder output format via the
         // engine): the cover scale needs the source aspect, never the view's.
@@ -248,40 +250,58 @@ class ActiveCallScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                // Peer video, full-bleed. TextureView, not SurfaceView: the
-                // peer's rotation is applied via this view's graphicsLayer,
-                // and a SurfaceView's SurfaceFlinger-composited layer does
-                // not honor render-node/view rotation (position/size sync
-                // only) — the rotation silently did nothing (LP3↔emulator
-                // retest 2026-09-25); TextureView draws in the view
-                // hierarchy, so the rotation applies. Composed for the whole
-                // call and attached once; the decode half starts when video
-                // turns On (or CallStarted with video) and this surface is
-                // attached.
+                // Peer video. TextureView, not SurfaceView: a SurfaceView's
+                // SurfaceFlinger-composited layer does not honor render-node/
+                // view rotation (position/size sync only) — the rotation
+                // silently did nothing (LP3↔emulator retest 2026-09-25);
+                // TextureView draws in the view hierarchy, so the transform
+                // applies. Composed for the whole call and attached once; the
+                // decode half starts when video turns On (or CallStarted with
+                // video) and this surface is attached.
+                //
+                // The buffer→view geometry is applied via setTransform: a
+                // TextureView otherwise STRETCHES the decoder buffer over its
+                // own bounds, which is what read as "very zoomed in" (a
+                // 1280x720 frame stretched over 1080x1240, then cover-scaled
+                // on top — feedback 2026-10-13). Instead: aspect-true, rotated
+                // by the peer's camera orientation, scaled so the frame
+                // exactly fills the horizontal edges, centered vertically.
+                fun applyVideoTransform(view: TextureView) {
+                    val src = videoSize
+                    if (src == null || src.first <= 0 || src.second <= 0 ||
+                        view.width <= 0 || view.height <= 0
+                    ) {
+                        return
+                    }
+                    val (sw, sh) = src
+                    val w = view.width.toFloat()
+                    val h = view.height.toFloat()
+                    // WhatsApp convention (real-call verified 2026-10-13):
+                    // the receiver rotates the frame (k+1)*90 clockwise — a
+                    // portrait phone signals 1 with 180°-held frames; a
+                    // desktop webcam signals 3 with upright frames. The old
+                    // k*90 was one step CCW short. Odd steps swap the frame's
+                    // on-screen dims.
+                    val rot = (orientation + 1) % 4
+                    val rotatedW = if (rot % 2 == 1) sh else sw
+                    val scale = w / rotatedW.toFloat()
+                    // setTransform operates in LAYER pixels, where the buffer
+                    // is already drawn stretched over the view (HWUI
+                    // Layer::draw applies the buffer→layer textureMatrix
+                    // before this matrix — AOSP main, Layer.cpp). Undo that
+                    // stretch first, then map the true-aspect frame: rotate,
+                    // scale to fill the horizontal edges exactly, center.
+                    val unstretch = Matrix().apply { setScale(sw / w, sh / h) }
+                    val fit = Matrix().apply {
+                        postTranslate(-sw / 2f, -sh / 2f)
+                        postRotate(rot * 90f)
+                        postScale(scale, scale)
+                        postTranslate(w / 2f, h / 2f)
+                    }
+                    view.setTransform(Matrix().apply { setConcat(fit, unstretch) })
+                }
                 AndroidView(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer {
-                            // Rotate per the peer's reported camera
-                            // orientation (90° steps 0..3), then scale
-                            // uniformly to cover: the decoded frame's aspect
-                            // (e.g. 4:3) must never stretch to the view —
-                            // max of the two ratios fills the view and
-                            // center-crops the rest (the pivot is the view
-                            // center). Odd steps swap the source dimensions.
-                            rotationZ = orientation * 90f
-                            val src = videoSize
-                            if (src != null && src.first > 0 && src.second > 0) {
-                                val rw = if (orientation % 2 == 1) src.second else src.first
-                                val rh = if (orientation % 2 == 1) src.first else src.second
-                                val cover = maxOf(
-                                    size.width / rw.toFloat(),
-                                    size.height / rh.toFloat(),
-                                )
-                                scaleX = cover
-                                scaleY = cover
-                            }
-                        },
+                    modifier = Modifier.fillMaxSize(),
                     factory = { context ->
                         TextureView(context).apply {
                             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -291,13 +311,16 @@ class ActiveCallScreen(
                                     height: Int,
                                 ) {
                                     viewModel.attachSurface(Surface(surface))
+                                    applyVideoTransform(this@apply)
                                 }
 
                                 override fun onSurfaceTextureSizeChanged(
                                     surface: SurfaceTexture,
                                     width: Int,
                                     height: Int,
-                                ) = Unit
+                                ) {
+                                    applyVideoTransform(this@apply)
+                                }
 
                                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                                     viewModel.attachSurface(null)
@@ -308,10 +331,12 @@ class ActiveCallScreen(
                             }
                         }
                     },
+                    update = { view -> applyVideoTransform(view) },
                 )
-                // Cover the video area while no video shows — a TextureView
-                // keeps showing its last decoded frame otherwise.
-                if (!videoOn) {
+                // Cover the video area while no video shows (ours off, or the
+                // peer's camera stopped — the decode half is down and a
+                // TextureView keeps showing its last decoded frame otherwise).
+                if (!videoOn || !peerVideoOn) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()

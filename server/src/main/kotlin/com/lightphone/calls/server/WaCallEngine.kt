@@ -90,9 +90,19 @@ object WaCallEngine : WaListener {
     private val _videoState = MutableStateFlow<VideoUiState>(VideoUiState.Off)
     val videoState: StateFlow<VideoUiState> = _videoState
 
+    /** Whether the PEER's camera is on — [videoState] tracks ours; without
+     *  this the surface freezes on the peer's last frame after they stop
+     *  (feedback 2026-10-13). */
+    private val _peerVideoOn = MutableStateFlow(false)
+    val peerVideoOn: StateFlow<Boolean> = _peerVideoOn
+
     /** Peer camera orientation in 90° steps (0..3), updated by the decode
      *  half — the UI rotates the surface with it. */
     val peerOrientation = MutableStateFlow(0)
+
+    /** Last known non-zero [peerOrientation] — held across a peer re-enable's
+     *  media-engine rebuild (see the decode link's onOrientation). */
+    private var lastPeerOrientation = 0
 
     /** The peer stream's decoded dimensions (decoder output format) — the
      *  UI's aspect-preserving cover scale needs the source aspect. */
@@ -624,7 +634,9 @@ object WaCallEngine : WaListener {
                     incomingVideoOffer = false
                     videoMode = false
                     _videoState.value = VideoUiState.Off
+                    _peerVideoOn.value = false
                     peerOrientation.value = 0
+                    lastPeerOrientation = 0
                     peerFrameSize.value = null
                     appContext?.let { WaCallService.tryStop(it) }
                     if (started && logPeer != null && logAt != 0L) {
@@ -749,24 +761,38 @@ object WaCallEngine : WaListener {
                         if (ok) {
                             videoMode = true
                             startVideoDecoding()
+                            _peerVideoOn.value = true
                         } else {
                             runCatching { bridge?.stopVideo() }
                         }
                     }
                     // Peer accepted OUR upgrade: mode opens, decode starts.
                     // 1 = peer camera on. Neither touches our camera state.
-                    4 -> if (!videoMode) {
-                        videoMode = true
-                        startVideoDecoding()
+                    4 -> {
+                        if (!videoMode) {
+                            videoMode = true
+                            startVideoDecoding()
+                        }
+                        _peerVideoOn.value = true
                     }
-                    1 -> if (videoMode) startVideoDecoding()
-                    // Peer camera off — the mode and our direction stay.
-                    6 -> Unit
+                    1 -> {
+                        _peerVideoOn.value = true
+                        if (videoMode) startVideoDecoding()
+                    }
+                    // Peer camera off — the mode and our direction stay. The
+                    // decode half KEEPS RUNNING: the bridge's frame channel is
+                    // bounded and the engine's media loop blocks when nobody
+                    // drains it, which backpressures outbound video and call
+                    // control (the 2026-10-13 "my video is delayed / call
+                    // persists" regression). The cover flag alone blanks the
+                    // frozen surface.
+                    6 -> _peerVideoOn.value = false
                     // Reject/cancel/timeout/disabled/error: the mode collapses.
                     else -> {
                         val eventEpoch = videoEpoch
                         if (videoEpoch == eventEpoch) {
                             _videoState.value = VideoUiState.Off
+                            _peerVideoOn.value = false
                             scope.launch {
                                 if (videoEpoch != eventEpoch) return@launch
                                 videoConsent = false
@@ -781,9 +807,18 @@ object WaCallEngine : WaListener {
             is WaEvent.OutboundVideoDropped -> {
                 Log.i(TAG, "outbound video dropped: ${event.accessUnits}")
                 // The relay shed OUR outbound AUs before transmission — the
-                // peer lost reference data, so the encoder's next frame must
-                // be an IDR (same signal the local overflow path carries).
-                encodeLink?.requestSyncFrame()
+                // peer lost reference data, so the encoder's next frame should
+                // be an IDR. But sheds arrive in bursts under congestion, and
+                // each IDR is ~10x a delta frame: shed → IDR → more sheds was
+                // a self-amplifying storm (2026-10-13 stall: 104 keyframes in
+                // 600 AUs saturated the uplink both ways). One sync frame per
+                // window answers the reference break; the rest of the burst
+                // sheds cleanly and the natural 1 s GOP bounds recovery.
+                val now = System.nanoTime()
+                if (now - lastShedSyncAt >= 2_000_000_000L) {
+                    lastShedSyncAt = now
+                    encodeLink?.requestSyncFrame()
+                }
                 videoLink?.requestSyncFrame()
             }
             is WaEvent.KeyframePressure -> {
@@ -1084,6 +1119,7 @@ object WaCallEngine : WaListener {
     }
 
     private fun stopVideoDecoding() {
+        _peerVideoOn.value = false
         decodeLink?.let { link -> decodeLink = null; link.stop() }
     }
 
@@ -1092,10 +1128,22 @@ object WaCallEngine : WaListener {
             if (decodeLink != null || fakeCall) return
             val surface = peerSurface ?: return
             val bridge = bridge ?: return
+            _peerVideoOn.value = true
             val link = VideoDecodeLink(
                 output = surface,
                 pull = { bridge.recvVideoFrame(50u) },
-                onOrientation = { peerOrientation.value = it },
+                onOrientation = { o ->
+                    // Sticky: a peer re-enable (state 1 after 6) races the
+                    // media engine's rebuild — frames can flow stamped 0
+                    // before the stanza's orientation control lands; once a
+                    // non-zero is held, never fall back to 0. No debounce:
+                    // genuine device rotations must apply immediately (the
+                    // 2026-10-13 2 s debounce lagged a quick portrait→
+                    // landscape→portrait test and left the video sideways on
+                    // return — removed same day).
+                    if (o != 0) lastPeerOrientation = o
+                    peerOrientation.value = if (o == 0) lastPeerOrientation else o
+                },
                 onFrameSize = { w, h -> peerFrameSize.value = w to h },
                 onEnded = { reason ->
                     Log.w(TAG, "video decode ended: $reason")
@@ -1123,6 +1171,10 @@ object WaCallEngine : WaListener {
 
     @Volatile
     private var videoLink: VideoLink? = null
+
+    /** Last shed-driven sync-frame request (nanoTime) — the OutboundVideoDropped
+     *  throttle, see the event handler. */
+    private var lastShedSyncAt = 0L
 
     private val _videoExerciseRunning = MutableStateFlow(false)
     val videoExerciseRunning: StateFlow<Boolean> = _videoExerciseRunning

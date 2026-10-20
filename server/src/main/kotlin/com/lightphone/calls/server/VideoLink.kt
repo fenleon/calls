@@ -176,6 +176,10 @@ class VideoLink(
             setInteger(MediaFormat.KEY_CAPTURE_RATE, tier.fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // 1 s GOP
             setInteger(MediaFormat.KEY_BITRATE_MODE, BIT_RATE_MODE_CBR)
+            // Emit each frame as soon as it's encoded — surface-input encoders
+            // otherwise hold ~2-4 frames of pipeline latency, a steady lag on
+            // every outbound frame. Ignored by codecs that don't support it.
+            setInteger(MediaFormat.KEY_LATENCY, 0)
             // QP caps (API 35 keys, string-valued here) so the rate control
             // can't starve far below the CBR target on low-motion scenes —
             // the soft AVC encoder inserts no filler.
@@ -488,7 +492,9 @@ private fun emitNalUnlessParameterSet(au: ByteArray, from: Int, to: Int, nalStar
  * Runs entirely on its own thread; [stop] joins it and releases the codec.
  * [onOrientation] fires with the latest frame's orientation (90° steps
  * 0..3, per `WaVideoFrame.orientation`) for the UI to rotate the surface —
- * the exact convention gets verified against a real call in V4.
+ * convention real-call verified 2026-10-13: the receiver rotates
+ * (k+1)×90° clockwise (official portrait phone signals 1 with 180°-held
+ * frames; webcam/desktop signals 3 with upright frames).
  * [onEnded] surfaces a crashed/dead decode path (codec error, released
  * surface); a normal [stop] does not fire it.
  */
@@ -570,16 +576,16 @@ class VideoDecodeLink(
                         if (frame.data.size <= buffer.capacity()) {
                             buffer.clear()
                             buffer.put(frame.data)
-                            // Seed: the first keyframe AU rides in as codec
-                            // config so SPS/PPS are in place before any
-                            // slice is decoded.
-                            val seed = !seeded
-                            seeded = true
                             ptsUs += PTS_STEP_US
-                            decoder.queueInputBuffer(
-                                index, 0, frame.data.size, ptsUs,
-                                if (seed) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0,
-                            )
+                            // The first keyframe queues as a NORMAL buffer:
+                            // WhatsApp repeats SPS/PPS inline on every IDR, and
+                            // marking the full AU BUFFER_FLAG_CODEC_CONFIG made
+                            // the qti decoder swallow the IDR as config — the
+                            // decoder then rendered deltas without references
+                            // (blackish artifacts) until the next GOP's IDR
+                            // resolved it (LP3, 2026-10-13).
+                            seeded = true
+                            decoder.queueInputBuffer(index, 0, frame.data.size, ptsUs, 0)
                             fed++
                         } else {
                             Log.w(TAG, "video AU too large for the decoder input (${frame.data.size} B) — dropped")
