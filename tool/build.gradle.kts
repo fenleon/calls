@@ -16,6 +16,9 @@ android {
         resources.excludes += setOf(
             "META-INF/INDEX.LIST",
             "META-INF/io.netty.versions.properties",
+            // Compose-Wasm browser resources the SDK ships (skiko.wasm,
+            // composeApp.js) — dead weight on Android.
+            "static/**",
         )
     }
 
@@ -41,6 +44,11 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("lightsdkDev")
+            // LP3 = arm64. The x86_64 Rust bridge exists only for emulator
+            // round-trips of release builds — drop it here (debug keeps both).
+            // Emulator-testing a release build needs a temporary
+            // abiFilters.add("x86_64") + rebuild.
+            ndk { abiFilters += "arm64-v8a" }
         }
     }
 

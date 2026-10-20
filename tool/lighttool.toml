@@ -1,8 +1,8 @@
 [tool]
 id = "com.lightphone.calls"
 label = "Calls"
-versionCode = 2
-versionName = "0.2.0"
+versionCode = 3
+versionName = "0.3.0"
 # Single-APK build (the Chats/Audiobooks pattern): the tool hosts its own
 # LightSdkService (embedded :server library with the WhatsApp WebSocket +
 # VoIP bridge) and binds to itself — serverPackage is the tool's own id, so
